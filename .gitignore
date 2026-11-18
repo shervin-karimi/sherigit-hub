@@ -1,0 +1,26 @@
+# Market data and generated outputs
+data/
+reports/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Backups
+*.bak
+*.backup
+*.bak_*
+*.py.bak*
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+secrets/
