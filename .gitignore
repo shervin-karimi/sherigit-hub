@@ -24,3 +24,7 @@ venv/
 *.pem
 *.key
 secrets/
+
+# Timestamped local backup files
+*-14050828
+*-14050820
