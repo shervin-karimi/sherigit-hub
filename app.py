@@ -76,6 +76,21 @@ footer{text-align:center;color:#91a2b8;font-size:12px;padding:20px}
 <h3>قراردادهای PUT</h3>
 <div id="puts" class="muted">هنوز بررسی نشده است.</div>
 </div>
+
+<div class="panel">
+<h3>تحلیل پیشرفته اختیار معامله</h3>
+<p class="muted">
+نتایج این بخش از فایل تحلیل ذخیره‌شده خوانده می‌شوند؛
+لزوماً با اطلاعات اسکن فعلی یکسان نیستند.
+</p>
+<button id="loadAnalysis" onclick="loadAnalysis()">
+نمایش تحلیل ذخیره‌شده
+</button>
+<p class="muted" id="analysisStatus">
+هنوز تحلیل بارگذاری نشده است.
+</p>
+<div id="analysisResults"></div>
+</div>
 <div class="panel">
 <h3>قواعد ایمنی</h3>
 <div class="muted">
@@ -177,6 +192,71 @@ document.getElementById('status').innerHTML='<span class="bad">دریافت نا
 document.getElementById('decision').textContent=e.message;
 }finally{b.disabled=false;b.textContent='دریافت و بررسی دوباره';}
 }
+
+function analysisValue(x){
+const n=Number(x);
+return x===null || x===undefined || x==='' ||
+       !Number.isFinite(n) ? 'نامشخص' : fmt(n);
+}
+function analysisCard(x){
+const symbol=String(x.symbol||'نامشخص');
+const type=String(x.option_type||'نامشخص');
+const iv=analysisValue(x.iv_mid);
+const delta=analysisValue(x.delta);
+const reason=String(x.iv_failure_reason||'ثبت نشده');
+
+const card=document.createElement('div');
+card.className='card';
+
+const title=document.createElement('h3');
+title.textContent=symbol+' | '+type;
+card.appendChild(title);
+
+const details=document.createElement('div');
+details.className='muted';
+details.textContent=
+'IV میانی: '+iv+'٪ | Delta: '+delta+
+' | علت خطای IV: '+reason;
+card.appendChild(details);
+
+return card;
+}
+async function loadAnalysis(){
+const button=document.getElementById('loadAnalysis');
+const status=document.getElementById('analysisStatus');
+const results=document.getElementById('analysisResults');
+
+button.disabled=true;
+status.textContent='در حال خواندن تحلیل ذخیره‌شده...';
+results.replaceChildren();
+
+try{
+const response=await fetch('/api/analysis');
+const data=await response.json();
+if(!response.ok) throw Error(data.error||'خطا در دریافت تحلیل');
+
+status.textContent=
+'تعداد: '+fmt(data.count)+
+' | Snapshot: '+(data.snapshot_received_at||'نامشخص')+
+' | وضعیت: '+data.analysis_status+
+' | مدل: '+data.model_status+
+' | سیگنال قابل معامله: خیر';
+
+const warning=document.createElement('p');
+warning.className='warn';
+warning.textContent=
+'این نتایج تاریخی/آزمایشی هستند؛ تازگی مظنه‌ها و اعتبار فرض‌های مالی تأیید نشده است.';
+results.appendChild(warning);
+
+const contracts=Array.isArray(data.contracts)?data.contracts:[];
+contracts.forEach(x=>results.appendChild(analysisCard(x)));
+
+}catch(e){
+status.textContent='خطا: '+e.message;
+}finally{
+button.disabled=false;
+}
+}
 </script>
 </body>
 </html>"""
@@ -264,12 +344,68 @@ def scan_market():
     result["fetched_at"] = snapshot_received_at.isoformat(timespec="seconds")
     return result
 
+
+def load_analysis():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent / "data" / "greeks_results.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+
+    if not isinstance(rows, list):
+        raise ValueError("Analysis data must be a list.")
+
+    snapshots = {
+        r.get("snapshot_received_at")
+        for r in rows
+        if isinstance(r, dict) and r.get("snapshot_received_at")
+    }
+
+    if len(snapshots) != 1 or len(rows) == 0:
+        status = "unknown"
+        snapshot = None
+    else:
+        snapshot = next(iter(snapshots))
+        try:
+            dt = datetime.fromisoformat(snapshot)
+            if dt.tzinfo is None:
+                raise ValueError("Timezone missing")
+            age = (datetime.now().astimezone() - dt).total_seconds()
+            status = "historical" if age > 900 else "recent_unverified"
+        except ValueError:
+            status = "unknown"
+
+    return {
+        "count": len(rows),
+        "snapshot_received_at": snapshot,
+        "analysis_status": status,
+        "model_status": "experimental_unverified",
+        "tradable_signal": False,
+        "warning": (
+            "Greeks are experimental. Quote freshness and "
+            "financial assumptions are not validated."
+        ),
+        "contracts": rows,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             body = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+        elif self.path == "/api/analysis":
+            try:
+                body = json.dumps(
+                    load_analysis(), ensure_ascii=False
+                ).encode("utf-8")
+                self.send_response(200)
+            except Exception as e:
+                body = json.dumps(
+                    {"error": str(e)}, ensure_ascii=False
+                ).encode("utf-8")
+                self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
         elif self.path == "/api/scan":
             try:
                 body = json.dumps(scan_market(), ensure_ascii=False).encode("utf-8")
