@@ -298,15 +298,15 @@ def main():
         )
 
         item["iv_mid"] = (
-            round(iv_mid * 100, 3) if iv_mid is not None else None
+            round(iv_mid * 100, 8) if iv_mid is not None else None
         )
 
         item["iv_ask"] = (
-            round(iv_ask * 100, 3) if iv_ask is not None else None
+            round(iv_ask * 100, 8) if iv_ask is not None else None
         )
 
         item["iv_bid"] = (
-            round(iv_bid * 100, 3) if iv_bid is not None else None
+            round(iv_bid * 100, 8) if iv_bid is not None else None
         )
 
         if iv_mid is not None:
