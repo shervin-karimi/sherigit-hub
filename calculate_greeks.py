@@ -73,7 +73,7 @@ def implied_volatility(option_type, market_price, S, K, T, r, q):
         )
         upper_bound = discounted_strike
 
-    tolerance = max(0.01, market_price * 1e-8)
+    tolerance = max(1e-8, market_price * 1e-10)
 
     if market_price < lower_bound - tolerance:
         return None
@@ -110,6 +110,43 @@ def implied_volatility(option_type, market_price, S, K, T, r, q):
             high = mid
 
     return (low + high) / 2
+
+
+def iv_failure_reason(option_type, price, S, K, T, r, q):
+    if (
+        option_type not in ("CALL", "PUT")
+        or price is None
+        or not all(
+            isinstance(v, (int, float)) and math.isfinite(v)
+            for v in (price, S, K, T, r, q)
+        )
+        or price <= 0 or S <= 0 or K <= 0 or T <= 0
+    ):
+        return "invalid_input"
+
+    ds = S * math.exp(-q * T)
+    dk = K * math.exp(-r * T)
+
+    lower = max(ds - dk, 0) if option_type == "CALL" else max(dk - ds, 0)
+    upper = ds if option_type == "CALL" else dk
+    threshold = max(1e-8, price * 1e-10)
+
+    if price < lower - threshold:
+        return "below_theoretical_bound"
+    if price - lower <= threshold:
+        return "near_lower_bound_unidentifiable"
+    if price >= upper:
+        return "outside_solver_range"
+
+    minimum = bs_price(option_type, S, K, T, r, q, MIN_VOL)
+    maximum = bs_price(option_type, S, K, T, r, q, MAX_VOL)
+
+    if minimum is None or maximum is None:
+        return "outside_solver_range"
+    if price < minimum or price > maximum:
+        return "outside_solver_range"
+
+    return None
 
 
 def calculate_greeks(option_type, S, K, T, r, q, sigma):
@@ -264,6 +301,7 @@ def main():
         item["vega_per_1pct"] = None
         item["rho_per_1pct"] = None
         item["iv_status"] = "invalid_input"
+        item["iv_failure_reason"] = None
 
         if (
             option_type not in ("CALL", "PUT")
@@ -309,7 +347,12 @@ def main():
             round(iv_bid * 100, 8) if iv_bid is not None else None
         )
 
-        if iv_mid is not None:
+        if iv_mid is None:
+            item["iv_failure_reason"] = iv_failure_reason(
+                option_type, mid, S, K, T,
+                RISK_FREE_RATE, DIVIDEND_YIELD
+            )
+        else:
             stats["iv_mid"] += 1
 
             greeks = calculate_greeks(
