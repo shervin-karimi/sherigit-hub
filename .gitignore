@@ -1,6 +1,8 @@
 # Market data and generated outputs
 data/
 reports/
+/CONTRACT_DIAGNOSTICS.md
+/LIVE_MARKET_VALIDATION.md
 *.db
 *.sqlite
 *.sqlite3

@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -352,7 +352,7 @@ class PaperTradingTests(unittest.TestCase):
 
     def test_migration_keeps_legacy_ledger_but_does_not_trust_historical_mark(self):
         self.path = self.path.with_name("v1.db")
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             for sql in SCHEMA:
                 db.execute(sql)
             db.execute("INSERT INTO account VALUES (1, 100000, 99000, 300)")
