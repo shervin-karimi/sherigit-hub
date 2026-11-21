@@ -1,8 +1,14 @@
 
 import argparse
+import json
 import sqlite3
 import sys
 from datetime import datetime, date
+from pathlib import Path
+
+from paper_monitor import PaperMonitor
+from paper_quotes import load_catalog
+from paper_trading import DB_PATH as PAPER_DB_PATH, PaperTrading
 
 DB_PATH = "data/trading.db"
 
@@ -256,6 +262,74 @@ def close_trade(args):
     print("توجه: این رقم بدون ضریب قرارداد، کارمزد و مالیات است و سود یا زیان خالص محسوب نمی‌شود.")
 
 
+def run_paper(args):
+    try:
+        quote_actions = ("buy", "mark", "sell", "monitor")
+        catalog = None
+        if args.action in quote_actions:
+            if args.catalog is None:
+                raise ValueError("--catalog is required for quote processing")
+            catalog = load_catalog(json.loads(args.catalog.read_text(encoding="utf-8")))
+        ledger = PaperTrading(args.db, catalog=catalog)
+        if args.action == "init":
+            ledger.initialize(args.equity, args.stop_bps)
+            result = ledger.status()
+        elif args.action in ("buy", "mark", "sell"):
+            quote = json.loads(args.quote.read_text(encoding="utf-8"))
+            if args.action == "buy":
+                result = ledger.buy(quote, args.quantity, order_id=args.order_id)
+            else:
+                operation = ledger.mark if args.action == "mark" else ledger.sell
+                result = operation(args.position_id, quote)
+        elif args.action in ("status", "history"):
+            result = ledger.status() if args.action == "status" else ledger.history()
+        elif args.action in ("pause", "resume"):
+            ledger.set_pause(args.action == "pause")
+            result = ledger.status()
+        elif args.action == "monitor":
+            monitor = PaperMonitor(ledger, args.interval)
+            monitor.run(args.feed, once=args.once)
+            result = monitor.status()
+        elif args.action == "monitor-status":
+            result = PaperMonitor(ledger).status()
+        else:
+            result = PaperMonitor(ledger).incidents()
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"Paper trading: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def add_paper_commands(commands):
+    paper = commands.add_parser("paper", help="معاملات آزمایشی آفلاین؛ بدون ارسال سفارش")
+    paper.add_argument("--db", type=Path, default=PAPER_DB_PATH)
+    paper.add_argument("--catalog", type=Path, help="فهرست محلی مشخصات تأییدشدهٔ قراردادها")
+    actions = paper.add_subparsers(dest="action", required=True)
+    init = actions.add_parser("init", help="راه‌اندازی حساب آزمایشی")
+    init.add_argument("--equity", type=int, required=True, help="سرمایهٔ اولیه به ریال")
+    init.add_argument("--stop-bps", type=int, default=300, help="آستانهٔ هشدار؛ ۳۰۰ یعنی ۳٪")
+    for name in ("buy", "mark", "sell"):
+        action = actions.add_parser(name)
+        action.add_argument("--quote", type=Path, required=True, help="فایل محلی مظنه (JSON)")
+        if name == "buy":
+            action.add_argument("--quantity", type=int, required=True)
+            action.add_argument("--order-id", required=True, help="شناسهٔ یکتا برای جلوگیری از ثبت تکراری")
+        else:
+            action.add_argument("--position-id", type=int, required=True)
+    actions.add_parser("status", help="وجه نقد، تخصیص، سود و زیان و موقعیت‌های باز")
+    actions.add_parser("history", help="تاریخچهٔ ورود و خروج آزمایشی")
+    actions.add_parser("pause", help="توقف اضطراری خرید آزمایشی")
+    actions.add_parser("resume", help="رفع توقف دستی خرید؛ محدودیت‌های ریسک همچنان برقرارند")
+    monitor = actions.add_parser("monitor", help="پایش آفلاین مظنه‌ها و خروج در مهلت")
+    monitor.add_argument("--feed", type=Path, required=True)
+    monitor.add_argument("--interval", type=int, default=15)
+    monitor.add_argument("--once", action="store_true")
+    actions.add_parser("monitor-status", help="آخرین وضعیت و زمان ضربان ناظر")
+    actions.add_parser("incidents", help="رخدادهای ثبت‌شده")
+    paper.set_defaults(func=run_paper)
+
+
 def build_parser():
     parser = PersianArgumentParser(
         description="سامانهٔ فارسی ثبت و مدیریت معاملات اختیار معامله"
@@ -280,7 +354,7 @@ def build_parser():
     p.add_argument("--دلیل", default="")
     p.set_defaults(func=add_signal)
 
-    p = commands.add_parser("خرید", help="ثبت خرید واقعی")
+    p = commands.add_parser("خرید", help="دفتر قدیمی: ثبت دستی خرید؛ بدون ارسال سفارش")
     p.add_argument("--پیشنهاد", type=int)
     p.add_argument("--نماد")
     p.add_argument("--نوع", choices=["اختیار خرید", "اختیار فروش"])
@@ -297,20 +371,21 @@ def build_parser():
     p = commands.add_parser("باز", help="نمایش معاملات باز")
     p.set_defaults(func=show_open_trades)
 
-    p = commands.add_parser("فروش", help="ثبت فروش و بستن معامله")
+    p = commands.add_parser("فروش", help="دفتر قدیمی: ثبت دستی فروش؛ بدون ارسال سفارش")
     p.add_argument("--شماره", type=int, required=True)
     p.add_argument("--قیمت", type=float, required=True)
     p.add_argument("--دلیل", default="بستن دستی معامله")
     p.set_defaults(func=close_trade)
 
+    add_paper_commands(commands)
     return parser
 
 
-def main():
+def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args()
-    args.func(args)
+    args = parser.parse_args(argv)
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
