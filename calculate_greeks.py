@@ -4,6 +4,7 @@ import math
 import csv
 from datetime import datetime
 from pathlib import Path
+from sys import float_info
 
 INPUT = Path("data/candidates.json")
 OUTPUT_JSON = Path("data/greeks_results.json")
@@ -17,136 +18,135 @@ DAYS_IN_YEAR = 365
 MIN_VOL = 0.0001
 MAX_VOL = 5.0
 BISECTION_STEPS = 150
+IV_PERCENT_DECIMALS = 8
 
 
 def normal_cdf(x):
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+    return 0.5 * math.erfc(-x / math.sqrt(2))
 
 
 def normal_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
 
-def bs_price(option_type, S, K, T, r, q, sigma):
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+def finite_numbers(*values):
+    try:
+        return all(type(value) in (int, float) and math.isfinite(value) for value in values)
+    except OverflowError:
+        return False
+
+
+def quote_midpoint(bid, ask):
+    if not finite_numbers(bid, ask) or not 0 < bid <= ask:
         return None
+    total = bid + ask
+    return total / 2 if finite_numbers(total) else bid + (ask - bid) / 2
 
-    sqrt_t = math.sqrt(T)
-    d1 = (
-        math.log(S / K)
-        + (r - q + 0.5 * sigma ** 2) * T
-    ) / (sigma * sqrt_t)
 
-    d2 = d1 - sigma * sqrt_t
+def _pricing_inputs(option_type, S, K, T, r, q):
+    if option_type not in ("CALL", "PUT") or not finite_numbers(S, K, T, r, q) or min(S, K, T) <= 0:
+        return None
+    rt, qt = r * float(T), q * float(T)
+    if not finite_numbers(rt, qt):
+        return None
+    try:
+        ds, dk = S * math.exp(-qt), K * math.exp(-rt)
+    except OverflowError:
+        return None
+    if not finite_numbers(ds, dk) or min(ds, dk) < float_info.min:
+        return None
+    ratio = S / K
+    log_ratio = math.log(ratio) if float_info.min <= ratio < math.inf else math.log(S) - math.log(K)
+    moneyness = log_ratio + (rt - qt)
+    if not math.isfinite(moneyness):
+        return None
+    return ds, dk, moneyness, math.sqrt(T)
 
+def _d_values(inputs, sigma):
+    width = sigma * inputs[3]
+    if not math.isfinite(width) or width <= 0:
+        return None
+    z = inputs[2] / width
+    return z + width / 2, z - width / 2
+
+
+def _price(option_type, inputs, sigma):
+    points = _d_values(inputs, sigma)
+    if points is None:
+        return None
+    d1, d2 = points
+    ds, dk = inputs[:2]
     if option_type == "CALL":
-        return (
-            S * math.exp(-q * T) * normal_cdf(d1)
-            - K * math.exp(-r * T) * normal_cdf(d2)
-        )
-
-    return (
-        K * math.exp(-r * T) * normal_cdf(-d2)
-        - S * math.exp(-q * T) * normal_cdf(-d1)
-    )
-
-
-def implied_volatility(option_type, market_price, S, K, T, r, q):
-    if market_price is None or market_price <= 0:
-        return None
-
-    if S <= 0 or K <= 0 or T <= 0:
-        return None
-
-    # کران‌های نظری اختیار اروپایی
-    discounted_spot = S * math.exp(-q * T)
-    discounted_strike = K * math.exp(-r * T)
-
-    if option_type == "CALL":
-        lower_bound = max(
-            discounted_spot - discounted_strike, 0
-        )
-        upper_bound = discounted_spot
+        price = ds * normal_cdf(d1) - dk * normal_cdf(d2)
     else:
-        lower_bound = max(
-            discounted_strike - discounted_spot, 0
-        )
-        upper_bound = discounted_strike
+        price = dk * normal_cdf(-d2) - ds * normal_cdf(-d1)
+    # A zero can be underflow; a negative cancellation artifact is not a price.
+    return price if math.isfinite(price) and price >= 0 else None
 
-    tolerance = max(1e-8, market_price * 1e-10)
 
-    if market_price < lower_bound - tolerance:
+def bs_price(option_type, S, K, T, r, q, sigma):
+    inputs = _pricing_inputs(option_type, S, K, T, r, q)
+    if inputs is None or not finite_numbers(sigma) or sigma <= 0:
         return None
+    return _price(option_type, inputs, sigma)
 
-    if market_price >= upper_bound:
-        return None
 
-    low = MIN_VOL
-    high = MAX_VOL
+def iv_price_tolerance(price):
+    # Relative repricing error only: a fixed absolute floor swallows tail prices.
+    return price * 1e-10
 
-    high_price = bs_price(
-        option_type, S, K, T, r, q, high
-    )
 
-    if high_price is None or high_price < market_price:
-        return None
+def _solve_iv(option_type, price, S, K, T, r, q):
+    inputs = _pricing_inputs(option_type, S, K, T, r, q)
+    if inputs is None or not finite_numbers(price) or price <= 0:
+        return None, "invalid_input"
+    if price < float_info.min:
+        return None, "outside_solver_range"
+    ds, dk = inputs[:2]
+    lower = max(ds - dk, 0) if option_type == "CALL" else max(dk - ds, 0)
+    upper = ds if option_type == "CALL" else dk
+    if price < lower:
+        return None, "below_theoretical_bound"
+    # Near a positive intrinsic bound the subtraction cannot resolve time value.
+    if lower > 0 and price - lower <= 8 * max(math.ulp(ds), math.ulp(dk)):
+        return None, "near_lower_bound_unidentifiable"
+    if upper - price <= 8 * math.ulp(upper):
+        return None, "outside_solver_range"
 
+    low, high = MIN_VOL, MAX_VOL
+    minimum = _price(option_type, inputs, low)
+    maximum = _price(option_type, inputs, high)
+    if minimum is None or maximum is None or minimum >= maximum or not minimum <= price <= maximum:
+        return None, "outside_solver_range"
+    if price == minimum:
+        return low, None
+    if price == maximum:
+        return high, None
+
+    # A large intrinsic value must not mask a missing time value.
+    tolerance = min(iv_price_tolerance(price), (price - lower) * 1e-6)
     for _ in range(BISECTION_STEPS):
         mid = (low + high) / 2
-
-        theoretical = bs_price(
-            option_type, S, K, T, r, q, mid
-        )
-
+        if not low < mid < high:
+            break
+        theoretical = _price(option_type, inputs, mid)
         if theoretical is None:
-            return None
-
-        if abs(theoretical - market_price) < tolerance:
-            return mid
-
-        if theoretical < market_price:
+            break
+        if theoretical >= float_info.min and abs(theoretical - price) <= tolerance:
+            return mid, None
+        if theoretical < price:
             low = mid
         else:
             high = mid
+    return None, "price_reconstruction_failed"
 
-    return (low + high) / 2
+
+def implied_volatility(option_type, market_price, S, K, T, r, q):
+    return _solve_iv(option_type, market_price, S, K, T, r, q)[0]
 
 
 def iv_failure_reason(option_type, price, S, K, T, r, q):
-    if (
-        option_type not in ("CALL", "PUT")
-        or price is None
-        or not all(
-            isinstance(v, (int, float)) and math.isfinite(v)
-            for v in (price, S, K, T, r, q)
-        )
-        or price <= 0 or S <= 0 or K <= 0 or T <= 0
-    ):
-        return "invalid_input"
-
-    ds = S * math.exp(-q * T)
-    dk = K * math.exp(-r * T)
-
-    lower = max(ds - dk, 0) if option_type == "CALL" else max(dk - ds, 0)
-    upper = ds if option_type == "CALL" else dk
-    threshold = max(1e-8, price * 1e-10)
-
-    if price < lower - threshold:
-        return "below_theoretical_bound"
-    if price - lower <= threshold:
-        return "near_lower_bound_unidentifiable"
-    if price >= upper:
-        return "outside_solver_range"
-
-    minimum = bs_price(option_type, S, K, T, r, q, MIN_VOL)
-    maximum = bs_price(option_type, S, K, T, r, q, MAX_VOL)
-
-    if minimum is None or maximum is None:
-        return "outside_solver_range"
-    if price < minimum or price > maximum:
-        return "outside_solver_range"
-
-    return None
+    return _solve_iv(option_type, price, S, K, T, r, q)[1]
 
 
 def calculate_greeks(option_type, S, K, T, r, q, sigma):
@@ -154,51 +154,44 @@ def calculate_greeks(option_type, S, K, T, r, q, sigma):
     if option_type not in ("CALL", "PUT"):
         raise ValueError("option_type must be CALL or PUT")
 
-    if sigma is None or sigma <= 0 or T <= 0:
+    inputs = _pricing_inputs(option_type, S, K, T, r, q)
+    if inputs is None or not finite_numbers(sigma) or sigma <= 0:
         return None
 
-    sqrt_t = math.sqrt(T)
-
-    d1 = (
-        math.log(S / K)
-        + (r - q + 0.5 * sigma ** 2) * T
-    ) / (sigma * sqrt_t)
-
-    d2 = d1 - sigma * sqrt_t
-
+    points = _d_values(inputs, sigma)
+    if points is None or not finite_numbers(*points):
+        return None
+    d1, d2 = points
+    ds, dk, _, sqrt_t = inputs
     pdf = normal_pdf(d1)
-    discount_q = math.exp(-q * T)
-    discount_r = math.exp(-r * T)
+    discount_q = ds / S
 
-    gamma = (
-        discount_q * pdf / (S * sigma * sqrt_t)
-    )
-
-    vega = S * discount_q * pdf * sqrt_t
+    gamma = (discount_q * pdf / (sigma * sqrt_t)) / S
+    vega = ds * pdf * sqrt_t
 
     if option_type == "CALL":
         delta = discount_q * normal_cdf(d1)
 
         theta_year = (
-            -S * discount_q * pdf * sigma / (2 * sqrt_t)
-            - r * K * discount_r * normal_cdf(d2)
-            + q * S * discount_q * normal_cdf(d1)
+            -ds * pdf * sigma / (2 * sqrt_t)
+            - r * dk * normal_cdf(d2)
+            + q * ds * normal_cdf(d1)
         )
 
-        rho = K * T * discount_r * normal_cdf(d2)
+        rho = dk * T * normal_cdf(d2)
 
     else:
-        delta = discount_q * (normal_cdf(d1) - 1)
+        delta = -discount_q * normal_cdf(-d1)
 
         theta_year = (
-            -S * discount_q * pdf * sigma / (2 * sqrt_t)
-            + r * K * discount_r * normal_cdf(-d2)
-            - q * S * discount_q * normal_cdf(-d1)
+            -ds * pdf * sigma / (2 * sqrt_t)
+            + r * dk * normal_cdf(-d2)
+            - q * ds * normal_cdf(-d1)
         )
 
-        rho = -K * T * discount_r * normal_cdf(-d2)
+        rho = -dk * T * normal_cdf(-d2)
 
-    return {
+    greeks = {
         "delta": delta,
         "gamma": gamma,
         "theta_per_day": theta_year / DAYS_IN_YEAR,
@@ -207,6 +200,7 @@ def calculate_greeks(option_type, S, K, T, r, q, sigma):
         "d1": d1,
         "d2": d2
     }
+    return greeks if finite_numbers(*greeks.values()) else None
 
 
 def get_time_to_expiry(contract):
@@ -224,8 +218,8 @@ def get_time_to_expiry(contract):
             ).date()
 
             days = (expiry_date - snapshot_date).days
-            if days > 0:
-                return days / DAYS_IN_YEAR, days
+            # A known as-of date is final, including on or after expiry.
+            return (days / DAYS_IN_YEAR, days) if days > 0 else (None, None)
         except (TypeError, ValueError):
             pass
 
@@ -241,13 +235,12 @@ def get_time_to_expiry(contract):
             ).date()
 
             days = (expiry_date - quote_date).days
-            if days > 0:
-                return days / DAYS_IN_YEAR, days
+            return (days / DAYS_IN_YEAR, days) if days > 0 else (None, None)
         except (TypeError, ValueError):
             pass
 
     days = contract.get("remaining_days") or 0
-    if days > 0:
+    if finite_numbers(days) and days > 0:
         return days / DAYS_IN_YEAR, days
 
     return None, None
@@ -288,6 +281,7 @@ def main():
 
         bid = c.get("best_bid") or 0
         ask = c.get("best_ask") or 0
+        mid = quote_midpoint(bid, ask)
 
         T, days = get_time_to_expiry(c)
 
@@ -305,12 +299,11 @@ def main():
 
         if (
             option_type not in ("CALL", "PUT")
+            or not finite_numbers(S, K)
             or S <= 0
             or K <= 0
             or T is None
-            or bid <= 0
-            or ask < bid
-            or ask <= 0
+            or mid is None
         ):
             results.append(item)
             stats["failed"] += 1
@@ -318,9 +311,7 @@ def main():
 
         stats["valid"] += 1
 
-        mid = (bid + ask) / 2
-
-        iv_mid = implied_volatility(
+        iv_mid, failure_reason = _solve_iv(
             option_type, mid, S, K, T,
             RISK_FREE_RATE, DIVIDEND_YIELD
         )
@@ -336,22 +327,19 @@ def main():
         )
 
         item["iv_mid"] = (
-            round(iv_mid * 100, 8) if iv_mid is not None else None
+            round(iv_mid * 100, IV_PERCENT_DECIMALS) if iv_mid is not None else None
         )
 
         item["iv_ask"] = (
-            round(iv_ask * 100, 8) if iv_ask is not None else None
+            round(iv_ask * 100, IV_PERCENT_DECIMALS) if iv_ask is not None else None
         )
 
         item["iv_bid"] = (
-            round(iv_bid * 100, 8) if iv_bid is not None else None
+            round(iv_bid * 100, IV_PERCENT_DECIMALS) if iv_bid is not None else None
         )
 
         if iv_mid is None:
-            item["iv_failure_reason"] = iv_failure_reason(
-                option_type, mid, S, K, T,
-                RISK_FREE_RATE, DIVIDEND_YIELD
-            )
+            item["iv_failure_reason"] = failure_reason
         else:
             stats["iv_mid"] += 1
 
