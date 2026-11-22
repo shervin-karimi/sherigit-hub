@@ -11,11 +11,12 @@ import secrets
 from socketserver import TCPServer
 import sqlite3
 import sys
+import unicodedata
 from urllib.parse import parse_qs, urlencode
 
-from approval_workflow import ApprovalStore, DECISIONS, utc_now
+from approval_workflow import ALLOCATION_PERCENT, HOLD_DAYS, ApprovalStore, DECISIONS, utc_now
 import dashboard_research as research
-from paper_quotes import timestamp
+from paper_quotes import MAX_SQLITE_INT, timestamp
 import shadow_collector as collector
 import shadow_multiday
 import shadow_watch as watch
@@ -24,7 +25,43 @@ import shadow_watch as watch
 HOST = "127.0.0.1"
 DB = watch.ROOT / "data/approval-dashboard/approvals.sqlite3"
 REVIEW = re.compile(r"/review/([0-9a-f]{32})")
+PREFLIGHT = "/preflight"
 MAX_FORM = 1024
+PREFLIGHT_MAX_FORM = 2048
+MANUAL_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+PREFLIGHT_PRICE_UNITS = {
+    "rial_unit": ("ریال به‌ازای هر واحد پایه", 1, True),
+    "toman_unit": ("تومان به‌ازای هر واحد پایه", 10, True),
+    "rial_contract": ("ریال به‌ازای هر قرارداد", 1, False),
+    "toman_contract": ("تومان به‌ازای هر قرارداد", 10, False),
+}
+PREFLIGHT_STRIKE_UNITS = {"rial": "ریال به‌ازای هر واحد پایه", "toman": "تومان به‌ازای هر واحد پایه"}
+PREFLIGHT_UNIT_SOURCES = {"broker_screen": "ورود دستی از صفحهٔ ایزی‌تریدر", "operator_stated": "واحد به گفتهٔ اپراتور"}
+PREFLIGHT_SETTLEMENT_DATES = {
+    "cash_settlement_date": "تاریخ تسویهٔ نقدی",
+    "physical_settlement_date": "تاریخ تسویهٔ فیزیکی",
+}
+PREFLIGHT_EVIDENCE_FIELDS = {"observed_strike_unit", "strike_unit_source", *PREFLIGHT_SETTLEMENT_DATES}
+PREFLIGHT_NUMBERS = {
+    "strike": "قیمت اعمال",
+    "contract_size": "اندازهٔ قرارداد (تعداد واحد پایه در هر قرارداد)",
+    "limit_price": "قیمت محدود خرید",
+    "quantity": "تعداد قرارداد",
+    "fee": "کارمزد کل خرید اعلام‌شده (ریال)",
+    "initial_equity": "سرمایهٔ اولیه (ریال)",
+    "committed": "بهای خرید باز و تعهد خریدهای دیگر (جمع، ریال)",
+    "cash": "وجه نقد در دسترس پس از کسر تعهدهای دیگر (ریال)",
+}
+PREFLIGHT_FIELDS = {"instrument", "symbol", "kind", "expiry", "strike_unit", "price_unit", "cash_unit", *PREFLIGHT_NUMBERS}
+PREFLIGHT_UNIT_LABELS = {
+    "strike_unit": "واحد قیمت اعمال",
+    "price_unit": "واحد و مبنای قیمت محدود خرید (پریمیوم)",
+    "cash_unit": "واحد کارمزد کل، سرمایهٔ اولیه، تعهدها و وجه نقد در دسترس",
+}
+MANUAL_SYMBOL = re.compile(
+    r"[A-Za-z\u0621-\u063a\u0641-\u064a\u067e\u0686\u0698\u06a9\u06af\u06cc]"
+    r"[A-Za-z0-9_\u0621-\u063a\u0640-\u064a\u067e\u0686\u0698\u06a9\u06af\u06cc\u200c-]{0,39}"
+)
 STATES = {
     "PENDING": "در انتظار بررسی", "APPROVED": "تأیید پژوهشی", "REJECTED": "رد شد",
     "EXPIRED": "منقضی", "CANCELLED": "لغو شد",
@@ -123,6 +160,12 @@ def page(title, inner):
  .pager{{display:flex;gap:.8rem;flex-wrap:wrap;align-items:center}} .pager:empty{{display:none}}
  .pager a{{display:inline-flex;align-items:center}} .badge{{display:inline-block;border:1px solid;border-radius:.3rem;padding:0 .35rem}}
  .rejected{{border-width:2px;font-weight:bold}}
+ .contract-comparison{{width:100%;table-layout:fixed;border-collapse:collapse;text-align:start;overflow-wrap:anywhere;font-size:.9rem}}
+ .contract-comparison th,.contract-comparison td{{border-block-end:1px solid #818181;padding:.25rem;text-align:start}}
+ .preflight-warning{{border-inline-start:.25rem solid;padding-inline:.6rem;overflow-wrap:anywhere}}
+ .preflight-warning ul,.preflight-checklist ol{{padding-inline-start:1.4rem}}
+ .preflight-warning li,.preflight-checklist li{{margin-block:.35rem}}
+ .contract-comparison th:last-child,.contract-comparison td:last-child{{width:26%;font-size:.82rem}}
  @media (min-width:26rem){{
    .metrics{{grid-template-columns:repeat(4,minmax(0,1fr))}}
  }}
@@ -391,7 +434,8 @@ def home(store, observations, archive_failed, now, *, report=None, query=None):
         research_html = (f'<p>آخرین دریافت HTTP (تهران): {display_receipt(latest["receipt_tehran"])} (میلادی)</p>{clock_note}'
                          + candidate_section(latest, comparison, query or research.Query())
                          + comparison_section(comparison))
-    return page("داشبورد تأیید انسانی", f"""<h2>مشاهدات آرشیوی TSE/IFB</h2>
+    return page("داشبورد تأیید انسانی", f"""<p><a href="{PREFLIGHT}">بررسی پیش از سفارش</a> — برآورد دستی، فقط‌خواندنی</p>
+<h2>مشاهدات آرشیوی TSE/IFB</h2>
 <p>دریافت HTTP از TSETMC زمان مظنهٔ بورس نیست. زمان و توالی دفتر سفارش نامعلوم‌اند.
 این داده‌ها زنده، قابل اجرا یا مبنای پرشدن آزمایشی نیستند.</p>{card_grid(cards)}
 {research_html}
@@ -400,6 +444,337 @@ def home(store, observations, archive_failed, now, *, report=None, query=None):
 <section><details><summary>تاریخچهٔ درخواست‌ها</summary>
 {'<ul>' + ''.join(history) + '</ul>' if history else 'درخواستی ثبت نشده است.'}</details></section>
 <section><h2>تاریخچهٔ مشاهدات</h2>{archive_note}{''.join(archived)}</section>""")
+
+
+def manual_number(form, key):
+    value = form[key].translate(MANUAL_DIGITS)
+    zero_allowed = key in ("fee", "committed", "cash")
+    if not value:
+        raise ValueError(f"{PREFLIGHT_NUMBERS[key]}: وارد نشده است.")
+    if not re.fullmatch(r"(?:0|[1-9][0-9]{0,17})", value) or (value == "0" and not zero_allowed):
+        allowed = "صفر فقط اگر مقدار واقعاً صفر است" if zero_allowed else "بزرگ‌تر از صفر"
+        raise ValueError(f"{PREFLIGHT_NUMBERS[key]}: عدد صحیح و بدون جداکننده لازم است ({allowed}).")
+    return int(value)
+
+
+def manual_expiry(value):
+    expiry_text = value.translate(MANUAL_DIGITS)
+    try:
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", expiry_text):
+            raise ValueError
+        return date.fromisoformat(expiry_text)
+    except ValueError:
+        raise ValueError("سررسید میلادی معتبر با قالب YYYY-MM-DD لازم است.") from None
+
+
+def manual_settlement_date(value, label):
+    """Validate Jalali shape and possible day ranges only; do not convert calendars."""
+    if not value:
+        return None
+    value = value.translate(MANUAL_DIGITS)
+    if re.fullmatch(r"[0-9]{4}/[0-9]{2}/[0-9]{2}", value):
+        year, month, day = map(int, value.split("/"))
+        if year > 0 and 1 <= month <= 12 and 1 <= day <= (31 if month <= 6 else 30):
+            return value
+    raise ValueError(f"{label}: قالب شمسی YYYY/MM/DD و شمارهٔ ماه و روز معتبر لازم است.")
+
+
+def manual_contract(form):
+    instrument = form["instrument"]
+    code = instrument.translate(MANUAL_DIGITS)
+    has_id = watch.positive_id(code)
+    symbol = form["symbol"]
+    if symbol and not MANUAL_SYMBOL.fullmatch(symbol.translate(MANUAL_DIGITS)):
+        raise ValueError("توقف بررسی هویت: نماد قرارداد نامعتبر است.")
+    if instrument and not has_id and (symbol or not MANUAL_SYMBOL.fullmatch(code)):
+        raise ValueError("توقف بررسی هویت: شناسهٔ ابزار نامعتبر است؛ در کنار فیلد نماد فقط insCode وارد کنید.")
+    if form["kind"] and form["kind"] not in ("CALL", "PUT"):
+        raise ValueError("نوع قرارداد نامعتبر است؛ CALL یا PUT را انتخاب کنید.")
+    observed_unit, unit_source = (form.get(key, "") for key in ("observed_strike_unit", "strike_unit_source"))
+    if observed_unit and observed_unit not in PREFLIGHT_STRIKE_UNITS:
+        raise ValueError("واحد مشاهده‌شدهٔ قیمت اعمال نامعتبر است.")
+    if unit_source and unit_source not in PREFLIGHT_UNIT_SOURCES:
+        raise ValueError("منشأ دستی واحد قیمت اعمال نامعتبر است.")
+    # Blank fields remain unknown for comparison; the estimator still requires them.
+    return dict(
+        ins_code=code if has_id else None, symbol=symbol or (instrument if not has_id else None) or None,
+        option_type=form["kind"] or None, maturity_date=manual_expiry(form["expiry"]) if form["expiry"] else None,
+        strike_price=manual_number(form, "strike") if form["strike"] else None,
+        strike_unit=form["strike_unit"] if form["strike_unit"] in PREFLIGHT_STRIKE_UNITS else None,
+        contract_size=manual_number(form, "contract_size") if form["contract_size"] else None,
+        observed_strike_unit=observed_unit or None, strike_unit_source=unit_source or None,
+        **{key: manual_settlement_date(form.get(key, ""), label) for key, label in PREFLIGHT_SETTLEMENT_DATES.items()},
+    )
+
+
+def preflight_checks(form, now, contract, unit_conflict):
+    """Pure arithmetic and warnings; no proposal or eligibility result."""
+    instrument = contract["ins_code"] or contract["symbol"]
+    if not instrument:
+        raise ValueError("شناسهٔ ابزار یا نماد قرارداد: هیچ‌کدام وارد نشده‌اند.")
+    if not contract["option_type"]:
+        raise ValueError("نوع قرارداد: انتخاب نشده است؛ CALL یا PUT را انتخاب کنید.")
+    expiry = contract["maturity_date"]
+    if expiry is None:
+        raise ValueError("تاریخ سررسید (میلادی): وارد نشده است.")
+    for key, supported in (("strike_unit", PREFLIGHT_STRIKE_UNITS), ("price_unit", PREFLIGHT_PRICE_UNITS),
+                           ("cash_unit", ("rial",))):
+        if not form[key]:
+            raise ValueError(f"{PREFLIGHT_UNIT_LABELS[key]}: انتخاب نشده است.")
+        if form[key] not in supported:
+            raise ValueError(f"{PREFLIGHT_UNIT_LABELS[key]}: نامعتبر یا مبهم است.")
+    if unit_conflict:
+        raise ValueError("واحد قیمت اعمال متعارض است؛ برآورد نمایش داده نمی‌شود.")
+    if contract["observed_strike_unit"] and not contract["strike_unit_source"]:
+        raise ValueError("منشأ دستی واحد مشاهده‌شدهٔ اعمال: انتخاب نشده است.")
+    if contract["strike_unit_source"] and not contract["observed_strike_unit"]:
+        raise ValueError("واحد مشاهده‌شدهٔ قیمت اعمال: انتخاب نشده است.")
+    values = {key: manual_number(form, key) for key in PREFLIGHT_NUMBERS}
+    price_label, rial_factor, per_unit = PREFLIGHT_PRICE_UNITS[form["price_unit"]]
+    principal = values["limit_price"] * rial_factor * values["quantity"]
+    if per_unit:
+        principal *= values["contract_size"]
+    total = principal + values["fee"]
+    cap = values["initial_equity"] * ALLOCATION_PERCENT // 100
+    committed = values["committed"]
+    days = (expiry - timestamp(now).astimezone(collector.TEHRAN).date()).days
+    warnings = []
+    if days < 0:
+        warnings.append("تاریخ سررسید واردشده گذشته است.")
+    elif days <= HOLD_DAYS:
+        warnings.append(f"سررسید نزدیک است: حداکثر {HOLD_DAYS} روز تقویمی تا تاریخ واردشده. افق نگهداری قابل اتکا نیست.")
+    if committed + principal > cap:
+        warnings.append(f"جمع بهای خرید و تعهدهای واردشده از سقف {ALLOCATION_PERCENT}٪ سرمایهٔ اولیه بیشتر است.")
+    elif committed + total > cap:
+        warnings.append(f"با احتساب کارمزد، برآورد از سقف {ALLOCATION_PERCENT}٪ بیشتر است؛ هشدار احتیاطی.")
+    if total > values["cash"]:
+        warnings.append("برآورد با کارمزد از وجه نقد در دسترس واردشده بیشتر است.")
+    return fields([
+        ("شناسه یا نماد / نوع", f"{ltr(instrument.translate(MANUAL_DIGITS))} / {ltr(form['kind'])}"),
+        ("قیمت اعمال", shown(values["strike"], suffix=" " + PREFLIGHT_STRIKE_UNITS[form["strike_unit"]])),
+        ("سررسید واردشده (میلادی) / فاصله از تاریخ تهران", f"{display_date(expiry.isoformat())} / {shown(days, suffix=' روز تقویمی')}"),
+        ("ضریب (اندازهٔ قرارداد)", shown(values["contract_size"], suffix=" واحد پایه در هر قرارداد")),
+        ("قیمت محدود خرید (پریمیوم واردشده)", shown(values["limit_price"], suffix=" " + price_label)),
+        ("تعداد سفارش", shown(values["quantity"], suffix=" قرارداد")),
+        ("بهای هر قرارداد، پیش از کارمزد", shown(principal // values["quantity"], suffix=" ریال به‌ازای هر قرارداد")),
+        ("بهای خرید به قیمت محدود، پیش از کارمزد", shown(principal, suffix=" ریال")),
+        ("کارمزد واردشده", shown(values["fee"], suffix=" ریال")),
+        ("جمع برآورد خرید با کارمزد", shown(total, suffix=" ریال")),
+        ("سرمایهٔ اولیهٔ واردشده", shown(values["initial_equity"], suffix=" ریال")),
+        ("سقف تجمیعی سرمایه", shown(cap, suffix=" ریال")),
+        ("بهای خرید باز و تعهدهای دیگرِ واردشده", shown(committed, suffix=" ریال")),
+        ("تعهدهای واردشده + بهای خرید (بدون کارمزد جدید)", shown(committed + principal, suffix=" ریال")),
+        ("تعهدهای واردشده + بهای خرید با کارمزد (برآورد احتیاطی)", shown(committed + total, suffix=" ریال")),
+        ("وجه نقد در دسترس واردشده", shown(values["cash"], suffix=" ریال")),
+    ]), warnings
+
+
+def comparison_observation(cache, now):
+    if cache is None:
+        return None, "هیچ مشاهدهٔ آرشیوشده‌ای در دسترس نیست."
+    report, failed = cache.get()
+    if (failed or not report
+            or (report.get("dataset_class"), report.get("source_url")) != (watch.DATA_CLASS, watch.SOURCE)):
+        return None, "خواندن یا اعتبارسنجی آرشیو ناموفق بود؛ دادهٔ قدیمی جایگزین نمی‌شود."
+    days = report["days"]
+    if not days:
+        return None, "هیچ مشاهدهٔ آرشیوشده‌ای در دسترس نیست."
+    latest = days[max(days)]  # Validated receipts are ordered; one latest receipt per Tehran date.
+    if timestamp(latest["receipt_utc"]) > timestamp(now):
+        return None, "زمان دریافت آرشیو از ساعت دستگاه جلوتر است."
+    return latest, ""
+
+
+def contract_comparison(broker, latest, note):
+    match, mismatch, unknown = "MATCHED_OBSERVATIONAL", "MISMATCH", "UNKNOWN"
+
+    def compare(entered, archived):
+        if entered is None or archived is None:
+            return unknown
+        return match if entered == archived else mismatch
+
+    def symbol_key(symbol):
+        # Broader lookup only to detect aliases/collisions; equality below is exact.
+        return research.text_key(symbol).translate(MANUAL_DIGITS)
+
+    def safe_symbol(value):
+        return value if isinstance(value, str) and 0 < len(value) <= 80 and value.strip() and not any(
+            unicodedata.category(c).startswith("C") and c != "\u200c" for c in value) else None
+
+    def archived_int(key):
+        value = archived.get(key)
+        return value if type(value) is int and 0 < value <= MAX_SQLITE_INT else None
+
+    code, symbol = broker["ins_code"], broker["symbol"]
+    contracts = latest["contracts"] if latest else {}
+    archive_code = code if code in contracts else None
+    if not archive_code and symbol and latest:
+        candidates = [key for key, row in contracts.items()
+                      if safe_symbol(row.get("symbol")) and symbol_key(row["symbol"]) == symbol_key(symbol)]
+        if len(candidates) == 1:
+            archive_code = candidates[0]
+            note = ("شناسهٔ واردشده در آخرین ثبت نیست؛ نماد به شناسهٔ دیگری اشاره می‌کند. "
+                    "مشخصات آن شناسه مقایسه نمی‌شوند." if code else
+                    "نماد در آخرین ثبت یکتاست، اما برای تطبیق هویت insCode را وارد کنید.")
+        elif len(candidates) > 1:
+            note = "نماد در آخرین ثبت مبهم است؛ هیچ قراردادی انتخاب نشد."
+    if not archive_code and latest and not note:
+        note = ("قرارداد در آخرین ثبت یافت نشد؛ دادهٔ قدیمی جایگزین نمی‌شود." if code or symbol
+                else "شناسه یا نماد قرارداد وارد نشده است.")
+
+    # Never use a symbol to substitute for a supplied but absent stable ID.
+    archived = contracts.get(archive_code, {}) if code is None or archive_code == code else {}
+    maturity = archived.get("maturity_date")
+    try:
+        expiry = datetime.strptime(maturity, "%Y%m%d").date() if (
+            isinstance(maturity, str) and re.fullmatch(r"[0-9]{8}", maturity)) else None
+    except ValueError:
+        expiry = None
+    kind = archived.get("option_type")
+    kind = kind if kind in ("CALL", "PUT") else None
+    strike, size = archived_int("strike_price"), archived_int("contract_size")
+    # Current normalized archive rows have no strike unit. Only an explicit
+    # supported per-underlying-unit declaration in the report permits comparison.
+    unit = archived.get("strike_unit")
+    unit = unit if isinstance(unit, str) and unit in PREFLIGHT_STRIKE_UNITS else None
+    entered_unit, observed_unit, unit_source = (broker[k] for k in (
+        "strike_unit", "observed_strike_unit", "strike_unit_source"))
+    manual_conflict = bool(entered_unit and observed_unit and entered_unit != observed_unit)
+    archive_conflict = bool(unit and any(value and value != unit for value in (entered_unit, observed_unit)))
+    unit_conflict = manual_conflict or archive_conflict
+    unit_status = (mismatch if unit_conflict else
+                   unknown if bool(observed_unit) != bool(unit_source) else compare(entered_unit, unit))
+    strike_status = compare(broker["strike_price"], strike) if unit_status == match else unknown
+
+    def strike_text(value, unit):
+        return f"{value} · {PREFLIGHT_STRIKE_UNITS.get(unit, 'واحد نامعلوم')}" if value is not None else None
+
+    archive_symbol = safe_symbol(archived.get("symbol"))
+    rows = [
+        ("شناسهٔ ابزار (insCode)", code, archive_code, compare(code, archive_code)),
+        ("نماد قرارداد", symbol, archive_symbol, compare(symbol, archive_symbol)),
+        ("نوع اختیار", broker["option_type"], kind, compare(broker["option_type"], kind)),
+        ("قیمت اعمال و واحد", strike_text(broker["strike_price"], entered_unit),
+         strike_text(strike, unit), strike_status),
+        ("سررسید (میلادی)", broker["maturity_date"], expiry, compare(broker["maturity_date"], expiry)),
+        ("اندازهٔ قرارداد (واحد پایه در هر قرارداد)", broker["contract_size"], size,
+         compare(broker["contract_size"], size)),
+    ]
+    observed_text = (
+        f"انتخاب فرم: {PREFLIGHT_STRIKE_UNITS.get(entered_unit, 'نامعلوم')} / "
+        f"مشاهده: {PREFLIGHT_STRIKE_UNITS.get(observed_unit, 'نامعلوم')} · "
+        f"{PREFLIGHT_UNIT_SOURCES.get(unit_source, 'منشأ دستی نامعلوم')}"
+    )
+    rows.append(("واحد اعمال؛ مشاهده و منشأ دستی", observed_text, PREFLIGHT_STRIKE_UNITS.get(unit), unit_status))
+    # No independently supported cash/physical settlement fields exist in this
+    # archive schema. An expiry date or a lookalike field cannot substitute.
+    rows.extend((f"{label} (شمسی)", broker[key], "در آرشیو نیست", unknown)
+                for key, label in PREFLIGHT_SETTLEMENT_DATES.items())
+    warning = ""
+    if (rows[0][3] != match or rows[2][3] != match or (symbol and rows[1][3] == unknown)
+            or any(status == mismatch for _, _, _, status in rows)):
+        warning = ('<p class="identity-block"><strong>توقف بررسی: '
+                   "هویت قرارداد نامعلوم است یا هویت/مشخصات اختلاف دارد.</strong> "
+                   "پیش از هر اقدام، قرارداد و مشخصات را از مرجع رسمی بررسی کنید.</p>")
+    notices = []
+    if manual_conflict:
+        notices.append("واحد مشاهده‌شدهٔ اعمال با واحد انتخاب‌شده در فرم تعارض دارد.")
+    if archive_conflict:
+        notices.append("واحد تصریح‌شدهٔ اعمال در آرشیو با اظهار دستی متفاوت است؛ مقدار قیمت مقایسه نشد.")
+    if not unit:
+        notices.append("واحد پشتیبانی‌شدهٔ قیمت اعمال در آرشیو نامعلوم است؛ مقدار خام مبنای ورود سفارش نیست.")
+    if not entered_unit:
+        notices.append("واحد انتخاب‌شدهٔ قیمت اعمال نامعلوم یا نامعتبر است.")
+    if bool(observed_unit) != bool(unit_source):
+        notices.append("شاهد دستی واحد اعمال یا طبقه‌بندی منشأ آن ناقص است.")
+    if not code:
+        notices.append("شناسهٔ ابزار وارد نشده است؛ بررسی شناسه کامل نیست.")
+    if not symbol:
+        notices.append("نماد وارد نشده است؛ بررسی نماد کامل نیست.")
+    receipt = (f'<p>آخرین دریافت HTTP آرشیو TSETMC (تهران): {display_receipt(latest["receipt_tehran"])}.</p>'
+               if latest else "")
+    body = "".join(
+        f'<tr><th scope="row">{h(label)}</th><td>{raw(entered)}</td><td>{raw(saved)}</td><td>{ltr(status)}</td></tr>'
+        for label, entered, saved, status in rows
+    )
+    if note:
+        notices.append(note)
+    alerts = warning + ("<ul>" + "".join(f"<li>{h(message)}</li>" for message in notices) + "</ul>" if notices else "")
+    return unit_conflict, alerts, (receipt +
+            '<table class="contract-comparison"><thead><tr>'
+            '<th scope="col">فیلد</th><th scope="col">ورودی دستی اپراتور</th><th scope="col">مشاهدهٔ تاریخی TSETMC</th>'
+            f'<th scope="col">نتیجه</th></tr></thead><tbody>{body}</tbody></table>')
+
+
+def preflight_page(token, *, estimate=None, warnings=(), invalid=False, alerts="", comparison=""):
+    def input_field(name, label, size, mode="text"):
+        return f'<label>{label}<input name="{name}" maxlength="{size}" inputmode="{mode}"></label>'
+
+    def choice(name, label, options):
+        return f'<label>{label}{select_input(name, {"": "نامشخص / انتخاب کنید", **options}, "")}</label>'
+
+    controls = "".join((
+        input_field("instrument", "شناسهٔ اختیار (insCode)؛ اگر معلوم نیست، نماد", 40),
+        input_field("symbol", "نماد قرارداد (اختیاری در کنار insCode)", 40),
+        choice("kind", "نوع قرارداد", {"CALL": "CALL", "PUT": "PUT"}),
+        input_field("expiry", "تاریخ سررسید (میلادی، YYYY-MM-DD)", 10),
+        choice("strike_unit", PREFLIGHT_UNIT_LABELS["strike_unit"], PREFLIGHT_STRIKE_UNITS),
+        choice("observed_strike_unit", "واحد مشاهده‌شدهٔ قیمت اعمال (اختیاری)", PREFLIGHT_STRIKE_UNITS),
+        choice("strike_unit_source", "منشأ دستی واحد مشاهده‌شده (اختیاری)", PREFLIGHT_UNIT_SOURCES),
+        *(input_field(key, f"{label} از صفحهٔ ایزی‌تریدر (اختیاری، شمسی YYYY/MM/DD)", 10)
+          for key, label in PREFLIGHT_SETTLEMENT_DATES.items()),
+        choice("price_unit", PREFLIGHT_UNIT_LABELS["price_unit"], {k: v[0] for k, v in PREFLIGHT_PRICE_UNITS.items()}),
+        choice("cash_unit", PREFLIGHT_UNIT_LABELS["cash_unit"], {"rial": "همهٔ این چهار مبلغ به ریال وارد شده‌اند"}),
+        *(input_field(name, label, 18, "numeric") for name, label in PREFLIGHT_NUMBERS.items()),
+    ))
+    result = ""
+    if invalid or estimate is not None:
+        result = ('<section><h2>محاسبه نامعتبر است</h2>' if invalid else
+                  '<section><h2>برآورد دستی — غیرقابل اجرا</h2>')
+        if warnings:
+            result += '<div class="preflight-warning"><ul role="alert">' + "".join(
+                f"<li>{h(warning)}</li>" for warning in warnings) + "</ul></div>"
+        result += estimate or ""
+        result += "</section>"
+    archive_warnings = (f'<section class="preflight-warning" role="alert"><h2>هشدارهای مقایسه با آرشیو</h2>'
+                        f'{alerts}</section>' if alerts else "")
+    return page("بررسی پیش از سفارش", f"""<p><a href="/">بازگشت به داشبورد</a></p>
+<section><p><strong>فقط پژوهش — حتی تطابق همهٔ ورودی‌ها مجوز معاملهٔ واقعی نیست.</strong></p>
+<p>فقط اعداد مشاهده‌شده در ایزی‌تریدر را دستی وارد کنید. دادهٔ دستی یا اسکرین‌شات مظنهٔ تأییدشده نیست.
+زمان معتبر مظنه، منشأ مستقل و مشخصات رسمی قرارداد بررسی نمی‌شوند؛ این صفحه مجوز یا مسیر ارسال سفارش ندارد.</p>
+<p>عدد صحیح و بدون جداکننده وارد کنید؛ واحد نامعلوم را حدس نزنید. رمز، اطلاعات حساب یا شناسهٔ سفارش وارد نکنید.
+ کارمزد، مبلغ کل اعلام‌شده برای همین تعداد است، نه درصد یا کارمزد هر قرارداد؛ اگر نامعلوم است خالی بگذارید.
+ کارمزد، سرمایه، تعهد و نقد را فقط به ریال وارد کنید؛ فرم این چهار مبلغ را تبدیل نمی‌کند.
+ فقط برای پریمیومِ واردشده با واحد تومان، هر تومان برابر ۱۰ ریال است.
+برای قیمتِ هر قرارداد، ضریب دوباره ضرب نمی‌شود؛ با این حال اندازهٔ قرارداد باید معلوم باشد.</p>
+<p>سقف تجمیعی {ALLOCATION_PERCENT}٪ سرمایهٔ اولیه و افق {HOLD_DAYS} روز تقویمی بررسی می‌شوند.
+تاریخ سررسید ساعت توقف معامله نیست. محاسبه از تاریخ دستگاه در تهران است و برای اجرا معتبر نیست.</p></section>
+ {result + archive_warnings if invalid else archive_warnings + result}
+ <section class="preflight-checklist"><h2>چک‌لیست نهایی سفارش دستی — فقط در ایزی‌تریدر رسمی</h2>
+ <ol>
+ <li>شناسهٔ ابزار، نماد، CALL/PUT، قیمت اعمال و واحد آن، سررسید و ضریب را دوباره تطبیق دهید.</li>
+ <li>بلافاصله پیش از هر ارسال دستی، نرخ زندهٔ خرید و فروش (bid/ask)، عمق، وضعیت جلسه و قیمت و واحد نمایش‌داده‌شده در فرم سفارش را بررسی کنید.</li>
+ <li>تعداد قرارداد، ضریب، کارمزد کل، وجه کل لازم و تعهد سفارش‌های باز را با هم تطبیق دهید.</li>
+ <li>وجه نقد در دسترس و سقف تجمیعی {ALLOCATION_PERCENT}٪ سرمایهٔ اولیه را دوباره بررسی کنید.</li>
+ <li>پیش از تصمیم، حداکثر زیان ممکن (از جمله از دست رفتن کل پریمیوم و کارمزد خرید)، برنامهٔ خروج و مهلت آن را بررسی کنید؛ خروج تضمین نیست.</li>
+ <li>سفارش‌های موجود، پرشدن‌های جزئی و لغوهای در انتظار را در ایزی‌تریدر بررسی کنید تا سفارش تکراری ندهید؛ تا روشن شدن وضعیت، دوباره ارسال نکنید.</li>
+ </ol>
+ <p><strong>اگر موردی بررسی نشده یا مبهم است، سفارش ندهید. حتی تکمیل چک‌لیست مجوز معامله نیست.</strong></p></section>
+<section><h2>ورود دستی</h2>
+<form method="post" action="{PREFLIGHT}" class="filters" autocomplete="off">
+<input type="hidden" name="csrf" value="{h(token)}">
+ {controls}<div class="filter-actions"><button type="submit">محاسبه و مقایسهٔ مشاهداتی</button>
+ <a href="{PREFLIGHT}">پاک کردن</a></div></form></section>
+ <section id="contract-comparison"><h2><bdi lang="en" dir="ltr">Manual EasyTrader vs archived contract comparison</bdi></h2>
+  <p>مقایسهٔ دستی مشخصات قرارداد. زمان دریافت HTTP، زمان مظنهٔ بورس نیست. حتی تطابق همهٔ فیلدها
+  تازگی مظنه، مشخصات رسمی یا مجوز معامله را ثابت نمی‌کند.</p>
+  <p><strong>شاهد رسمی مشخصات، اعمال و تسویه: در دسترس نیست (UNKNOWN).</strong>
+  تاریخ‌های تسویه فقط اظهار دستی‌اند؛ با سررسید میلادی مقایسه نمی‌شوند.
+  کنترل تاریخ شمسی فقط قالب و دامنهٔ ممکن ماه/روز است؛ کبیسه و برابری تقویمی احراز نشده‌اند.</p>
+ {comparison}
+ <p><bdi dir="ltr">MATCHED_OBSERVATIONAL</bdi>: تطابق در آرشیو، بدون تأیید مستقل؛
+ <bdi dir="ltr">MISMATCH</bdi>: اختلاف صریح؛ <bdi dir="ltr">UNKNOWN</bdi>: داده، منشأ یا واحد کافی نیست.
+ واحدهای متفاوت قیمت اعمال بدون مدرک تبدیل مقایسه نمی‌شوند؛ هیچ تبدیل ضمنی انجام نمی‌شود.</p></section>""")
 
 
 def review(row, events, token, now, available):
@@ -478,7 +853,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
                          "base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if location:
@@ -492,6 +867,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def header_is(self, key, value):
         return self.headers.get_all(key) == [value]
+
+    def read_form(self, keys, limit, *, optional=frozenset()):
+        lengths = self.headers.get_all("Content-Length", [])
+        if (not self.header_is("Content-Type", "application/x-www-form-urlencoded")
+                or self.headers.get_all("Transfer-Encoding") or len(lengths) != 1
+                or not re.fullmatch(r"[1-9][0-9]{0,3}", lengths[0]) or int(lengths[0]) > limit):
+            raise ValueError("invalid form framing")
+        size = int(lengths[0])
+        body = self.rfile.read(size)
+        if len(body) != size or re.search(rb"%(?![0-9a-fA-F]{2})", body):
+            raise ValueError("truncated or malformed form")
+        allowed = keys | optional
+        form = parse_qs(body.decode("ascii"), keep_blank_values=True, strict_parsing=True,
+                        max_num_fields=len(allowed), errors="strict")
+        if not keys <= form.keys() <= allowed or any(len(v) != 1 for v in form.values()):
+            raise ValueError("missing or duplicate form field")
+        return {key: v[0] for key, v in form.items()}
+
+    def valid_csrf(self, token):
+        return re.fullmatch(r"[0-9a-f]{64}", token) and secrets.compare_digest(token, self.server.csrf)
 
     def do_GET(self):
         if not self.header_is("Host", self.server.authority):
@@ -509,6 +904,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     observations = summary_cards(report) if report else []
                 return self.respond(200, home(self.server.store, observations, failed,
                                               self.server.clock(), report=report, query=query))
+            if self.path == PREFLIGHT:
+                return self.respond(200, preflight_page(self.server.csrf))
             if match := REVIEW.fullmatch(self.path):
                 row, events = self.server.store.detail(match[1])
                 if row:
@@ -525,29 +922,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 or self.headers.get_all("Sec-Fetch-Site") not in (None, ["same-origin"])):
             return self.fail(403, "مبدأ درخواست معتبر نیست.")
         match = REVIEW.fullmatch(self.path)
-        if not match:
+        preflight = self.path == PREFLIGHT
+        if not match and not preflight:
             return self.fail(404, "درخواست یافت نشد.")
-        lengths = self.headers.get_all("Content-Length", [])
-        if (not self.header_is("Content-Type", "application/x-www-form-urlencoded")
-                or self.headers.get_all("Transfer-Encoding") or len(lengths) != 1
-                or not re.fullmatch(r"[1-9][0-9]{0,3}", lengths[0]) or int(lengths[0]) > MAX_FORM):
-            return self.fail(400, "قالب فرم معتبر نیست.")
+        keys = {"csrf"} if preflight else {"csrf", "fingerprint", "decision", "confirmed"}
         try:
-            size = int(lengths[0])
-            body = self.rfile.read(size)
-            if len(body) != size:
-                raise ValueError("truncated request")
-            form = parse_qs(body.decode("ascii"), keep_blank_values=True, strict_parsing=True,
-                            max_num_fields=4, errors="strict")
-            if (set(form) != {"csrf", "fingerprint", "decision", "confirmed"}
-                    or any(len(v) != 1 for v in form.values())):
-                raise ValueError("missing or duplicate form field")
+            form = self.read_form(keys, PREFLIGHT_MAX_FORM if preflight else MAX_FORM,
+                                  optional=PREFLIGHT_FIELDS | PREFLIGHT_EVIDENCE_FIELDS if preflight else frozenset())
         except (ValueError, TimeoutError):
             return self.fail(400, "فرم نامعتبر یا ناقص است.")
-        token, fingerprint, decision = (form[k][0] for k in ("csrf", "fingerprint", "decision"))
-        if not re.fullmatch(r"[0-9a-f]{64}", token) or not secrets.compare_digest(token, self.server.csrf):
+        if not self.valid_csrf(form["csrf"]):
             return self.fail(403, "نشانهٔ امنیتی نامعتبر است؛ صفحه را تازه کنید.")
-        if (form["confirmed"] != ["yes"] or decision not in DECISIONS
+        if preflight:
+            # Missing data fields get the same field-specific diagnostics as blank
+            # inputs; framing, the allowlist and the CSRF field stay strict.
+            form = dict.fromkeys(PREFLIGHT_FIELDS, "") | form
+            try:
+                contract = manual_contract(form)
+            except ValueError as error:
+                return self.respond(400, preflight_page(self.server.csrf, warnings=[str(error)], invalid=True))
+            now = self.server.clock()
+            latest, note = comparison_observation(self.server.cache, now)
+            unit_conflict, alerts, comparison = contract_comparison(contract, latest, note)
+            try:
+                estimate, warnings = preflight_checks(form, now, contract, unit_conflict)
+            except ValueError as error:
+                return self.respond(400, preflight_page(self.server.csrf, warnings=[str(error)], invalid=True,
+                                                        alerts=alerts, comparison=comparison))
+            return self.respond(200, preflight_page(self.server.csrf, estimate=estimate, warnings=warnings,
+                                                    alerts=alerts, comparison=comparison))
+        fingerprint, decision = form["fingerprint"], form["decision"]
+        if (form["confirmed"] != "yes" or decision not in DECISIONS
                 or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)):
             return self.fail(400, "تصمیم و تأیید صریح همین نسخه لازم است.")
         try:
