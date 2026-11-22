@@ -5,7 +5,7 @@ from sys import float_info
 
 from calculate_greeks import (
     DAYS_IN_YEAR, DIVIDEND_YIELD as Q, IV_PERCENT_DECIMALS, MAX_VOL, MIN_VOL,
-    RISK_FREE_RATE as R, bs_price, iv_price_tolerance, quote_midpoint,
+    RISK_FREE_RATE as R, _iv_problem, _iv_value, bs_price, quote_midpoint,
 )
 
 INPUT = Path("data/greeks_results.csv")
@@ -44,16 +44,19 @@ def reconstruct(row):
     # Compare the quote with the price interval implied by rounding IV to
     # eight decimal places in percent. No tick-size or absolute error floor.
     half_step = 0.5 * 10**(-IV_PERCENT_DECIMALS) / 100 + math.ulp(iv)
-    low = bs_price(kind, S, K, T, R, Q, max(MIN_VOL, iv - half_step))
     theoretical = bs_price(kind, S, K, T, R, Q, iv)
-    high = bs_price(kind, S, K, T, R, Q, min(MAX_VOL, iv + half_step))
-    if any(value is None or not math.isfinite(value) for value in (low, theoretical, high)):
+    if theoretical is None:
         raise ValueError("invalid model output")
-    tolerance = iv_price_tolerance(market)
-    within_tolerance = (
-        high > 0 and low - market <= tolerance and market - high <= tolerance
-    )
-    return market, theoretical, within_tolerance
+    problem, _ = _iv_problem(kind, market, S, K, T, R, Q)
+    if problem is None:
+        return market, theoretical, False
+    inputs, from_upper, target, tolerance = problem
+    ends = [_iv_value(inputs, from_upper, sigma) for sigma in
+            (max(MIN_VOL, iv - half_step), min(MAX_VOL, iv + half_step))]
+    if any(value is None or not math.isfinite(value) for value in ends):
+        raise ValueError("invalid model output")
+    # Check the informative gap, not just the rounded total premium.
+    return market, theoretical, max(ends) > 0 and min(ends) - tolerance <= target <= max(ends) + tolerance
 
 
 def main():

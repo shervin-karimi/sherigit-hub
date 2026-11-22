@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "registry_version": 1,
+  "scope_fa": "بورس تهران و فرابورس ایران؛ خودرو فقط نمونهٔ محلی است و به سری‌ها یا بازارهای دیگر تعمیم داده نمی‌شود.",
+  "topics": {
+    "strike": {
+      "label_fa": "قیمت اعمال",
+      "gap_fa": "فهرست رسمی TSE/IFB برای همان سری و تاریخ اثر: شناسهٔ اختیار و پایه، نوع، قیمت اعمال، واحد و اصلاحیه‌های تعدیل؛ تطبیق با ردیف فید بر اساس شناسه، نه فقط نام نماد."
+    },
+    "multiplier": {
+      "label_fa": "ضریب قرارداد",
+      "gap_fa": "اندازه و دارایی قابل تحویل به‌ازای هر قرارداد در اطلاعیهٔ رسمی، شامل تغییرات ضریب پس از اقدام شرکتی و تاریخ اثر آن‌ها."
+    },
+    "currency_unit": {
+      "label_fa": "ارز و واحد قیمت",
+      "gap_fa": "مشخصات رسمی و فرهنگ دادهٔ فید برای ارز و مقیاس قیمت اعمال، پایه، bid/ask و تسویه (ریال/تومان، به‌ازای سهم/قرارداد، tick)، همراه نمونهٔ خام قابل تطبیق و نمونهٔ محاسبهٔ مستقل."
+    },
+    "expiry": {
+      "label_fa": "سررسید و آخرین معامله",
+      "gap_fa": "تقویم و اطلاعیهٔ رسمی همان سری، شامل تاریخ/ساعت و منطقهٔ زمانی آخرین معامله و سررسید، تعطیلی/تمدید و اصلاحیه؛ تاریخ endDate به‌تنهایی قطع معامله یا مهلت اعمال نیست."
+    },
+    "exercise_settlement": {
+      "label_fa": "اعمال و تسویه",
+      "gap_fa": "نسخه و بند لازم‌الاجرای دستورالعمل، اطلاعیهٔ سری و رویهٔ سپرده‌گذاری مرکزی: سبک و پنجرهٔ اعمال، خودکار یا درخواستی و پیش‌فرض عدم اقدام، تسویهٔ نقدی/فیزیکی، مرجع قیمت، زمان پرداخت/تحویل و هزینه‌ها."
+    },
+    "quote_timestamps": {
+      "label_fa": "زمان و توالی مظنه",
+      "gap_fa": "سند رسمی فید برای منشأ ساعت بورس و ارائه‌دهنده، منطقهٔ زمانی و دقت، معنا/دامنهٔ توالی و وضعیت جلسه؛ نمونهٔ هم‌زمان دفتر اختیار و پایه با شناسه و تطبیق مستقل. receipt و HTTP Date جای زمان مظنه نیستند."
+    },
+    "interest_rate": {
+      "label_fa": "نرخ تنزیل و قرارداد نرخ",
+      "gap_fa": "قیمت‌های رسمی نقطه‌درزمان، جریان نقد و تقویم اوراق دولتی ریالی برای ساخت منحنی تنزیل هم‌سررسید؛ تاریخ دسترسی، نقدشوندگی، تعریف بازده، مبنای روزشمار، روش تبدیل به نرخ پیوسته و بازبینی مستقل."
+    },
+    "dividends": {
+      "label_fa": "سود نقدی و اقدامات شرکتی",
+      "gap_fa": "اطلاعیه‌های کدال و بورس که در زمان مشاهده قابل دسترس بودند: مبلغ و تاریخ‌های مرتبط، اقدامات شرکتی و تعدیل strike/ضریب؛ بررسی مستقل در افق قرارداد و پرهیز از شمارش دوبارهٔ اثر سود/تعدیل."
+    }
+  },
+  "records": [
+    {
+      "id": "seo_rules",
+      "classification": "official_primary",
+      "verification_status": "missing_document",
+      "publisher": "سازمان بورس و اوراق بهادار",
+      "source_url": "https://www.seo.ir/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["exercise_settlement"],
+      "claim_fa": "اصل دستورالعمل معاملات اختیار، متن تجمیعی و اصلاحیه‌ها با شماره، پیوست، تاریخ اثر و دامنهٔ TSE/IFB در دست نیست؛ URL فقط درگاه پیگیری است."
+    },
+    {
+      "id": "tse_series",
+      "classification": "official_primary",
+      "verification_status": "missing_document",
+      "publisher": "بورس اوراق بهادار تهران",
+      "source_url": "https://www.tse.ir/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["strike", "multiplier", "currency_unit", "expiry", "exercise_settlement", "dividends"],
+      "claim_fa": "اصل اطلاعیهٔ آغاز معاملات و فهرست رسمی شناسه‌ها/مشخصات همان سری، اصلاحیه‌های تعدیل و اطلاعیهٔ سررسید/اعمال در دست نیست؛ URL فقط درگاه پیگیری است."
+    },
+    {
+      "id": "ifb_series_and_bonds",
+      "classification": "official_primary",
+      "verification_status": "missing_document",
+      "publisher": "فرابورس ایران",
+      "source_url": "https://www.ifb.ir/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["strike", "multiplier", "currency_unit", "expiry", "exercise_settlement", "interest_rate", "dividends"],
+      "claim_fa": "اصل اطلاعیه‌ها/اصلاحیه‌های سری فرابورسی و دادهٔ نقطه‌درزمان اوراق دولتی و مشخصات جریان نقد برای منحنی نرخ در دست نیست؛ URL فقط درگاه پیگیری است."
+    },
+    {
+      "id": "csd_settlement",
+      "classification": "official_primary",
+      "verification_status": "missing_document",
+      "publisher": "سپرده‌گذاری مرکزی اوراق بهادار و تسویه وجوه",
+      "source_url": "https://www.csdiran.ir/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["currency_unit", "expiry", "exercise_settlement"],
+      "claim_fa": "رویه و اطلاعیهٔ معتبر عملیاتیِ اعمال/تسویه برای سری و تاریخ مورد نظر در دست نیست؛ URL فقط درگاه پیگیری است."
+    },
+    {
+      "id": "feed_spec",
+      "classification": "official_primary",
+      "verification_status": "missing_document",
+      "publisher": "مدیریت فناوری بورس تهران (TSETMC) / ناشر فید بورس",
+      "source_url": "https://www.tsetmc.com/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["currency_unit", "quote_timestamps"],
+      "claim_fa": "سند فنی نسخه‌دار واحد/معنای فیلدها، مُهر زمانی و توالی قابل استناد دفتر اختیار و پایه در دست نیست؛ URL فقط درگاه پیگیری است."
+    },
+    {
+      "id": "codal_disclosure",
+      "classification": "official_primary",
+      "verification_status": "missing_document",
+      "publisher": "ناشر دارایی پایه (درگاه کدال)",
+      "source_url": "https://www.codal.ir/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["dividends"],
+      "claim_fa": "افشاهای سود و اقدامات شرکتی مربوط به تاریخ مشاهده و افق همان قرارداد در دست نیست؛ URL فقط درگاه پیگیری است."
+    },
+    {
+      "id": "shakhesban_269501",
+      "classification": "secondary_republication",
+      "verification_status": "unretrieved_lead",
+      "publisher": "شاخص‌بان",
+      "source_url": "https://www.shakhesban.com/stocks/messages/269501",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["strike", "multiplier", "currency_unit", "expiry", "exercise_settlement"],
+      "claim_fa": "سرنخ معرفی‌شده برای بازنشر اطلاعیهٔ اختیار بورس تهران؛ متن، شماره، تاریخ و سری مربوط بررسی نشده‌اند و ادعای جزئی ثبت نمی‌شود."
+    },
+    {
+      "id": "hoghogh_amendments",
+      "classification": "secondary_republication",
+      "verification_status": "unretrieved_lead",
+      "publisher": "حقوق.ai",
+      "source_url": "https://hoghogh.ai/circulars/c-63f0dae0",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["expiry", "exercise_settlement"],
+      "claim_fa": "سرنخ معرفی‌شده برای بازنشر اصلاحیه‌های مقررات؛ متن، مرجع صادرکننده، نسخه، تاریخ اثر و دامنهٔ شمول بررسی نشده‌اند."
+    },
+    {
+      "id": "shakhesban_280381",
+      "classification": "secondary_republication",
+      "verification_status": "local_summary_unverified",
+      "publisher": "شاخص‌بان",
+      "source_url": "https://www.shakhesban.com/stocks/messages/280381",
+      "publication_date": "1405/08/04 (شمسی، تاریخ منتسب به اطلاعیه، نه تاریخ انتشار بازنشر)",
+      "observation_date": null,
+      "local_reference": "contract_diagnostics.py",
+      "topics": ["multiplier", "expiry", "exercise_settlement"],
+      "claim_fa": "خلاصهٔ محلی اطلاعیهٔ منتسب 181/140511566 برای خانوادهٔ اختیار خودرو: ۱٬۰۰۰ سهم، سررسید ۱۴۰۵/۱۱/۰۷، اعمال اروپایی/غیرخودکار، نقدی توافقی و تحویل فیزیکی در سررسید. متن اصلی و فهرست شناسه‌ها تأیید نشده‌اند."
+    },
+    {
+      "id": "tasnim_treasury",
+      "classification": "historical_market_observation",
+      "verification_status": "unretrieved_lead",
+      "publisher": "خبرگزاری تسنیم",
+      "source_url": "https://www.tasnimnews.ir/fa/news/1405/04/28/3650667/",
+      "publication_date": null,
+      "observation_date": null,
+      "topics": ["interest_rate"],
+      "claim_fa": "سرنخ گزارش تاریخی بازده خزانه؛ ۱۴۰۵/۰۴/۲۸ فقط از مسیر URL پیداست. نرخ، تاریخ مشاهده، ورقه، سررسید و تعریف بازده احراز نشده‌اند. حتی پس از احراز، گزارش تاریخی جایگزین خودکار نرخ تنزیل نقطه‌درزمان مدل نیست."
+    },
+    {
+      "id": "khodro_archive_manual_2",
+      "classification": "historical_market_observation",
+      "verification_status": "observation_unverified",
+      "publisher": "TSETMC (واچ‌لیست اختیار؛ ثبت محلی Shadow Watch)",
+      "source_url": "https://cdn.tsetmc.com/api/Instrument/GetInstrumentOptionMarketWatch/1",
+      "publication_date": null,
+      "observation_date": "2026-11-22T09:49:47.189635+03:30 (دریافت تهران، نه زمان مظنه)",
+      "local_reference": "Shadow Watch manual:2؛ ممیزی محلی greeks_contract_report.py",
+      "topics": ["strike", "multiplier", "expiry", "quote_timestamps"],
+      "assertions": [
+        {"topic": "strike", "scope": "TSE/60210342490439455/manual:2/raw-feed", "field": "strikePrice", "value": "650"},
+        {"topic": "strike", "scope": "TSE/13308854503358443/manual:2/raw-feed", "field": "strikePrice", "value": "700"},
+        {"topic": "multiplier", "scope": "TSE/60210342490439455/manual:2/raw-feed", "field": "contractSize", "value": "1000"},
+        {"topic": "multiplier", "scope": "TSE/13308854503358443/manual:2/raw-feed", "field": "contractSize", "value": "1000"},
+        {"topic": "expiry", "scope": "TSE/60210342490439455/manual:2/raw-feed", "field": "endDate", "value": "2027-01-27"},
+        {"topic": "expiry", "scope": "TSE/13308854503358443/manual:2/raw-feed", "field": "endDate", "value": "2027-01-27"}
+      ],
+      "claim_fa": "برای ضخود1165 و ضخود1166 مقدار خام قیمت اعمال ۶۵۰ و ۷۰۰، ضریب ۱۰۰۰ و endDate برابر 20270127 دیده شد؛ زمان بورس/ناشر مظنه و توالی احراز نشدند. مشاهدهٔ فید تأیید رسمی هویت، واحد، ساعت سررسید یا قابلیت اجرا نیست."
+    },
+    {
+      "id": "model_rate",
+      "classification": "unsupported_assumption",
+      "verification_status": "unverified",
+      "publisher": "کد محلی پروژه (نه منبع بازار)",
+      "source_url": null,
+      "publication_date": null,
+      "observation_date": null,
+      "local_reference": "calculate_greeks.py: RISK_FREE_RATE",
+      "topics": ["interest_rate"],
+      "claim_fa": "43.94% ثابت با ترکیب پیوسته در کد استفاده می‌شود؛ منبع، تاریخ و قرارداد نرخ مبدأ نامعلوم‌اند. تبدیل ln(1+0.4394) فقط سناریوی فرض نرخ مؤثر سالانه است، نه نرخ مشاهده‌شده."
+    },
+    {
+      "id": "model_dividend",
+      "classification": "unsupported_assumption",
+      "verification_status": "unverified",
+      "publisher": "کد محلی پروژه (نه منبع بازار)",
+      "source_url": null,
+      "publication_date": null,
+      "observation_date": null,
+      "local_reference": "calculate_greeks.py: DIVIDEND_YIELD",
+      "topics": ["dividends"],
+      "claim_fa": "بازده سود پیوسته q=0 فرض مدل است، نه شاهد نبود سود نقدی یا تعدیل."
+    },
+    {
+      "id": "model_payoff_time_units",
+      "classification": "unsupported_assumption",
+      "verification_status": "unverified",
+      "publisher": "کد محلی پروژه (نه منبع بازار)",
+      "source_url": null,
+      "publication_date": null,
+      "observation_date": null,
+      "local_reference": "calculate_greeks.py و greeks_contract_report.py",
+      "topics": ["currency_unit", "expiry", "exercise_settlement", "interest_rate"],
+      "claim_fa": "مدل پژوهشی اروپایی، هم‌واحد بودن قیمت پایه/اعمال/پریمیوم و تقریب روزهای تقویمی تقسیم بر ۳۶۵ بدون ساعت سررسید را فرض می‌کند؛ این موارد سندِ واحد، قواعد تسویه یا روزشمار بازار/منحنی نیستند."
+    }
+  ]
+}

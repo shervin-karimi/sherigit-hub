@@ -19,14 +19,18 @@ MIN_VOL = 0.0001
 MAX_VOL = 5.0
 BISECTION_STEPS = 150
 IV_PERCENT_DECIMALS = 8
+SQRT_2 = math.sqrt(2)
+SQRT_2PI = math.sqrt(2 * math.pi)
+LOG_SQRT_2PI = math.log(SQRT_2PI)
+LOG_HALF_MIN_SUBNORMAL = math.log(math.ulp(0.0)) - math.log(2)
 
 
 def normal_cdf(x):
-    return 0.5 * math.erfc(-x / math.sqrt(2))
+    return 0.5 * math.erfc(-x / SQRT_2)
 
 
 def normal_pdf(x):
-    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+    return math.exp(-0.5 * x * x) / SQRT_2PI
 
 
 def finite_numbers(*values):
@@ -56,11 +60,18 @@ def _pricing_inputs(option_type, S, K, T, r, q):
     if not finite_numbers(ds, dk) or min(ds, dk) < float_info.min:
         return None
     ratio = S / K
-    log_ratio = math.log(ratio) if float_info.min <= ratio < math.inf else math.log(S) - math.log(K)
-    moneyness = log_ratio + (rt - qt)
+    if 0.5 <= ratio <= 2:
+        log_ratio = math.log1p((S - K) / K)
+    else:
+        log_ratio = math.log(ratio) if float_info.min <= ratio < math.inf else math.log(S) - math.log(K)
+    carry = (r - q) * float(T)
+    moneyness = log_ratio + carry if math.isfinite(carry) else math.fsum((log_ratio, rt, -qt))
     if not math.isfinite(moneyness):
         return None
-    return ds, dk, moneyness, math.sqrt(T)
+    # Avoid subtracting two independently rounded discounted prices near parity.
+    gap = (max(ds, dk) * -math.expm1(-abs(moneyness)) if abs(moneyness) < math.log(2)
+           else abs(ds - dk))
+    return ds, dk, moneyness, math.sqrt(T), gap
 
 def _d_values(inputs, sigma):
     width = sigma * inputs[3]
@@ -70,18 +81,118 @@ def _d_values(inputs, sigma):
     return z + width / 2, z - width / 2
 
 
-def _price(option_type, inputs, sigma):
+def _weighted_cdf(scale, x):
+    cdf = normal_cdf(x)
+    if cdf >= float_info.min or x >= 0:
+        return scale * cdf
+    if not math.isfinite(x):
+        return 0.0
+    # Far left normal tail: use the asymptotic Mills ratio before multiplying.
+    # At the binary64 underflow threshold these eight terms exceed its precision.
+    term, series = 1.0, 1.0
+    for n in range(1, 9):
+        term *= -(2 * n - 1) / (x * x)
+        series += term
+    return math.exp(math.log(scale) - 0.5 * x * x - LOG_SQRT_2PI - math.log(-x) + math.log(series))
+
+
+def _integral(f, budget):
+    """Adaptive Simpson on [0, 1]; its error estimate is dimensionless."""
+    def integrate(a, b, left, mid, right, whole, tolerance, depth):
+        m = (a + b) / 2
+        lm, rm = f((a + m) / 2), f((m + b) / 2)
+        l = (m - a) * (left + 4 * lm + mid) / 6
+        r = (b - m) * (mid + 4 * rm + right) / 6
+        error = l + r - whole
+        if abs(error) <= 15 * tolerance:
+            return l + r + error / 15
+        if not depth:
+            return None
+        first = integrate(a, m, left, lm, mid, l, tolerance / 2, depth - 1)
+        second = integrate(m, b, mid, rm, right, r, tolerance / 2, depth - 1)
+        return first + second if first is not None and second is not None else None
+
+    left, mid, right = f(0), f(.5), f(1)
+    return integrate(0, 1, left, mid, right, (left + 4 * mid + right) / 6, budget, 48)
+
+
+def _integrated_vega(scale, z, width, endpoint):
+    # OTM time value / scale = ∫[0,w] φ(-|m|/u + u/2) du.
+    # Factor out the largest density on the interval. In a deep tail the
+    # endpoint slope gives the scale of the narrow layer that carries the mass.
+    peak = max(endpoint, 0.0)
+    if not math.isfinite(peak):
+        return 0.0
+    log_scale = math.log(scale) + math.log(width) - LOG_SQRT_2PI - 0.5 * peak * peak
+    if log_scale < LOG_HALF_MIN_SUBNORMAL:
+        return 0.0  # Even the upper bound on the positive integral rounds to zero.
+
+    def density(x):
+        if not x:
+            return 0.0
+        if peak > 0:
+            shift = (1 - x) * (z / x + width / 2)
+            return math.exp(-shift * (peak + shift / 2))
+        d = z / x - width * x / 2
+        return math.exp(-0.5 * d * d)
+
+    integral = _integral(density, 1e-13 / max(1, peak * (z + width / 2)))
+    return math.exp(log_scale + math.log(integral)) if integral and integral > 0 else None
+
+
+def _time_value(inputs, sigma):
+    ds, dk, m, sqrt_t, _ = inputs
+    width = sigma * sqrt_t
+    if not math.isfinite(width) or width <= 0:
+        return None
+    small, large = (dk, ds) if m >= 0 else (ds, dk)
+    if m == 0:
+        # Exact ATM-forward identity; use the leading term only when omitted
+        # O(w²) relative terms are below floating-point rounding.
+        if width <= math.sqrt(float_info.epsilon):
+            return (small / SQRT_2PI) * width
+        return small * math.erf(width / (2 * SQRT_2))
+    z = abs(m) / width
+    endpoint = z - width / 2
+    pos = _weighted_cdf(small, -endpoint)
+    neg = _weighted_cdf(large, -z - width / 2)
+    difference = pos - neg
+    # Switch algorithms, not prices: avoid losing more than ~2 decimal digits
+    # to subtraction, or subtracting rounded/subnormal weighted tail terms.
+    if pos >= float_info.min and difference > .01 * pos and difference >= float_info.min:
+        return difference
+    return _integrated_vega(small, z, width, endpoint)
+
+
+def _bounds(option_type, inputs):
+    ds, dk, m, _, gap = inputs
+    return ((gap if m > 0 else 0.0), ds) if option_type == "CALL" else ((gap if m < 0 else 0.0), dk)
+
+
+def price_bounds(option_type, S, K, T, r, q):
+    inputs = _pricing_inputs(option_type, S, K, T, r, q)
+    return _bounds(option_type, inputs) if inputs is not None else None
+
+
+def _upper_gap(inputs, sigma):
     points = _d_values(inputs, sigma)
     if points is None:
         return None
     d1, d2 = points
     ds, dk = inputs[:2]
-    if option_type == "CALL":
-        price = ds * normal_cdf(d1) - dk * normal_cdf(d2)
+    return _weighted_cdf(ds, -d1) + _weighted_cdf(dk, d2)
+
+
+def _price(option_type, inputs, sigma):
+    time_value = _time_value(inputs, sigma)
+    if time_value is None:
+        return None
+    lower, upper = _bounds(option_type, inputs)
+    if time_value > min(inputs[:2]) / 2:
+        price = upper - _upper_gap(inputs, sigma)
     else:
-        price = dk * normal_cdf(-d2) - ds * normal_cdf(-d1)
-    # A zero can be underflow; a negative cancellation artifact is not a price.
-    return price if math.isfinite(price) and price >= 0 else None
+        price = lower + time_value
+    return price if math.isfinite(price) and lower <= price <= upper else None
 
 
 def bs_price(option_type, S, K, T, r, q, sigma):
@@ -96,45 +207,63 @@ def iv_price_tolerance(price):
     return price * 1e-10
 
 
-def _solve_iv(option_type, price, S, K, T, r, q):
+def _iv_problem(option_type, price, S, K, T, r, q):
     inputs = _pricing_inputs(option_type, S, K, T, r, q)
     if inputs is None or not finite_numbers(price) or price <= 0:
         return None, "invalid_input"
     if price < float_info.min:
-        return None, "outside_solver_range"
-    ds, dk = inputs[:2]
-    lower = max(ds - dk, 0) if option_type == "CALL" else max(dk - ds, 0)
-    upper = ds if option_type == "CALL" else dk
+        return None, "subnormal_premium_unidentifiable"
+    lower, upper = _bounds(option_type, inputs)
     if price < lower:
         return None, "below_theoretical_bound"
-    # Near a positive intrinsic bound the subtraction cannot resolve time value.
-    if lower > 0 and price - lower <= 8 * max(math.ulp(ds), math.ulp(dk)):
+    if price > upper:
+        return None, "above_theoretical_bound"
+    # The rounding intervals of a premium and bound one float apart touch.
+    if lower > 0 and price <= math.nextafter(lower, math.inf):
         return None, "near_lower_bound_unidentifiable"
-    if upper - price <= 8 * math.ulp(upper):
-        return None, "outside_solver_range"
+    if price >= math.nextafter(upper, -math.inf):
+        return None, "near_upper_bound_unidentifiable"
+    time_value, deficit = price - lower, upper - price
+    from_upper = deficit < time_value
+    target = deficit if from_upper else time_value
+    return (inputs, from_upper, target, min(iv_price_tolerance(price), target * 1e-6)), None
+
+
+def _iv_value(inputs, from_upper, sigma):
+    return _upper_gap(inputs, sigma) if from_upper else _time_value(inputs, sigma)
+
+
+def _solve_iv(option_type, price, S, K, T, r, q):
+    problem, reason = _iv_problem(option_type, price, S, K, T, r, q)
+    if problem is None:
+        return None, reason
+    inputs, from_upper, target, tolerance = problem
 
     low, high = MIN_VOL, MAX_VOL
-    minimum = _price(option_type, inputs, low)
-    maximum = _price(option_type, inputs, high)
-    if minimum is None or maximum is None or minimum >= maximum or not minimum <= price <= maximum:
+    a, b = (_iv_value(inputs, from_upper, x) for x in (low, high))
+    if a is None or b is None or (a < b if from_upper else a > b):
+        return None, "price_evaluation_failed"
+    if a == b:
+        return None, "volatility_unidentifiable" if target == a else "outside_solver_range"
+    # The gap is evaluated directly, but a published premium is rounded. At an
+    # exact repriced bracket endpoint recognize that representation, not an epsilon.
+    for sigma, value in ((low, a), (high, b)):
+        if target == value or (abs(target - value) <= math.ulp(price) / 2
+                               and _price(option_type, inputs, sigma) == price):
+            return sigma, None
+    if not min(a, b) <= target <= max(a, b):
         return None, "outside_solver_range"
-    if price == minimum:
-        return low, None
-    if price == maximum:
-        return high, None
 
-    # A large intrinsic value must not mask a missing time value.
-    tolerance = min(iv_price_tolerance(price), (price - lower) * 1e-6)
     for _ in range(BISECTION_STEPS):
         mid = (low + high) / 2
         if not low < mid < high:
             break
-        theoretical = _price(option_type, inputs, mid)
+        theoretical = _iv_value(inputs, from_upper, mid)
         if theoretical is None:
-            break
-        if theoretical >= float_info.min and abs(theoretical - price) <= tolerance:
+            return None, "price_evaluation_failed"
+        if theoretical > 0 and abs(theoretical - target) <= tolerance:
             return mid, None
-        if theoretical < price:
+        if (from_upper and theoretical > target) or (not from_upper and theoretical < target):
             low = mid
         else:
             high = mid
@@ -162,7 +291,7 @@ def calculate_greeks(option_type, S, K, T, r, q, sigma):
     if points is None or not finite_numbers(*points):
         return None
     d1, d2 = points
-    ds, dk, _, sqrt_t = inputs
+    ds, dk, _, sqrt_t, _ = inputs
     pdf = normal_pdf(d1)
     discount_q = ds / S
 
