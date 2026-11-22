@@ -144,9 +144,10 @@ class SyntheticMultidayTests(unittest.TestCase):
             tracking.session_calendar(path)
 
     def test_http_adapter_uses_fixed_public_get_and_preserves_body_bytes(self):
-        response = MagicMock(status=200, headers={"Date": "HTTP Date is not quote time"})
-        response.geturl.return_value = watch.SOURCE
         raw = b'{ "instrumentOptMarketWatch" : [] }\n'
+        response = MagicMock(status=200, headers={"Date": "HTTP Date is not quote time",
+                                                  "Content-Length": str(len(raw))})
+        response.geturl.return_value = watch.SOURCE
         response.read.return_value = raw
         opener = MagicMock()
         opener.open.return_value.__enter__.return_value = response
@@ -172,7 +173,7 @@ class SyntheticMultidayTests(unittest.TestCase):
                 patch.object(collector, "fetch", return_value=(b"{}", received, {})) as fake:
             with self.assertRaisesRegex(watch.ArchiveError, "invalid TSETMC"):
                 collector.collect()
-            fake.assert_called_once_with()
+            fake.assert_called_once_with(timeout=collector.REQUEST_TIMEOUT)
             self.assertEqual(list(target.iterdir()), [])
         # Storage and the full report use explicitly synthetic records above. Here mock
         # the commit to verify the production wrapper without stamping fixtures as real.
@@ -186,5 +187,5 @@ class SyntheticMultidayTests(unittest.TestCase):
             self.assertEqual(collector.collect(), first)
             with self.assertRaisesRegex(watch.ArchiveError, "minimum 60 seconds"):
                 collector.collect()
-            fake.assert_called_once_with()
+            fake.assert_called_once_with(timeout=collector.REQUEST_TIMEOUT)
             commit.assert_called_once()

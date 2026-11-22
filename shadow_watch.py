@@ -200,8 +200,8 @@ def contract_states(path, meta):
                 require(value is None or (type(value) is int and -2**63 <= value <= 2**63 - 1
                                           and (value >= 0 or key == "remaining_days")),
                         f"invalid numeric field {key}: {code}")
-            require(contract["symbol"] is None or isinstance(contract["symbol"], str),
-                    f"invalid symbol: {code}")
+            require(all(contract[key] is None or isinstance(contract[key], str)
+                        for key in ("symbol", "underlying_symbol")), f"invalid symbol: {code}")
 
             spot = contract["underlying_closing_price"] or 0
             strike = contract["strike_price"]
@@ -214,7 +214,7 @@ def contract_states(path, meta):
             bid, ask = (contract[key] for key in PRICE_FIELDS)
             prices_ok = bool(bid and ask and bid <= ask)
             states[code] = {
-                key: contract[key] for key in ("symbol", *IDENTITY, *OBSERVED_NUMBERS)
+                key: contract[key] for key in ("symbol", "underlying_symbol", *IDENTITY, *OBSERVED_NUMBERS)
             } | {
                 "spread_percent": round((ask - bid) / ((bid + ask) / 2) * 100, 6) if prices_ok else None,
                 "two_sided": bool(prices_ok and contract["bid_volume"] and contract["ask_volume"]),
@@ -223,6 +223,7 @@ def contract_states(path, meta):
                 "rank_eligible": False,
                 "rank_rejection": None,
                 "iv_status": None,
+                "iv_failure_reason": None,
                 "greeks_assumption_status": None,
             }
         require(states, "snapshot has no identifiable option contracts")
@@ -234,6 +235,7 @@ def contract_states(path, meta):
             states[contract["ins_code"]].update(
                 rank_eligible=eligible, rank_rejection=None if eligible else reason,
                 iv_status=contract["iv_status"],
+                iv_failure_reason=contract["iv_failure_reason"],
                 greeks_assumption_status=contract["greeks_assumption_status"],
             )
     return dict(sorted(states.items()))
