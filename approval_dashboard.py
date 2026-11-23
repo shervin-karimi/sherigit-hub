@@ -26,6 +26,7 @@ HOST = "127.0.0.1"
 DB = watch.ROOT / "data/approval-dashboard/approvals.sqlite3"
 REVIEW = re.compile(r"/review/([0-9a-f]{32})")
 PREFLIGHT = "/preflight"
+COMBINED_RESEARCH = "/research/combined"
 MAX_FORM = 1024
 PREFLIGHT_MAX_FORM = 2048
 PREFLIGHT_LOSS_PERCENT = 2
@@ -214,6 +215,14 @@ def visible_state(row, now):
 
 
 OBSERVATIONAL = "صرفاً مقایسهٔ مشاهداتی؛ نه سود، نه بازده قابل اجرا و نه مظنهٔ لحظه‌ای."
+COMBINED_WARNING = (
+    '<p class="preflight-warning"><strong>مشاهدهٔ آرشیوی، نه دادهٔ زنده '
+    '(<bdi dir="ltr">ARCHIVED / NOT LIVE</bdi>)؛ نه سیگنال یا پیشنهاد معامله.</strong><br>'
+    'دسترسی تاریخی تأیید نشده (<bdi dir="ltr">point_in_time_verified=false</bdi>)؛ '
+    'فرض‌های Greeks آزمایشی (<bdi dir="ltr">experimental_unverified</bdi>)؛ '
+    'غیرقابل اجرا (<bdi dir="ltr">execution_eligible=false</bdi>)؛ '
+    'سقف تعداد نامعلوم (<bdi dir="ltr">risk.max_quantity=UNKNOWN</bdi>).</p>'
+)
 COMPARISON_LABELS = {
     "best_bid": "خرید", "best_ask": "فروش", "spread_percent": "اسپرد (واحد درصد)",
     "bid_volume": "عمق خرید", "ask_volume": "عمق فروش", "trade_count": "تعداد معاملات",
@@ -393,6 +402,148 @@ def candidate_section(latest, comparison, query):
             f'<nav class="pager" aria-label="صفحه‌بندی">{" ".join(links)}</nav></section>')
 
 
+def combined_value(value, *, suffix=""):
+    return ltr("UNKNOWN") if value is None else shown(value, suffix=suffix)
+
+
+def combined_option_card(row):
+    screen = row.get("screening") or {}
+    rejection, rank_rejection = screen.get("candidate_rejection"), screen.get("rank_rejection")
+    screened = research.combined_screening(row)
+    screening = research.COMBINED_SCREENING[screened]
+    if rejection:
+        screening += " — " + CANDIDATE_REASONS.get(rejection, "علت در دادهٔ پژوهشی ثبت شده است")
+    if rank_rejection:
+        rank = "رد در رتبه‌بندی — " + rank_rejection
+    elif screen.get("rank_eligible") is True:
+        rank = "عبور از قواعد رتبه؛ نه پیشنهاد یا مجوز"
+    else:
+        rank = "ارزیابی نشده"
+    expiry = row.get("maturity_date")
+    expiry = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}" if isinstance(expiry, str) and re.fullmatch(
+        r"[0-9]{8}", expiry) else None
+    details = fields([
+        ("کد رد غربال", raw(rejection)),
+        ("طبقهٔ خام مظنه", combined_value(row.get("quote_class"))),
+        ("ایرادهای نقدشوندگی ثبت‌شده", raw("، ".join(row.get("liquidity_issues") or ()) or None)),
+        ("وضعیت IV", raw(screen.get("iv_status"))),
+        ("وضعیت مدل این ردیف", raw(screen.get("greeks_assumption_status"))),
+        ("واحد قیمت / عمق / ضریب", " / ".join(combined_value(row.get(key))
+                                              for key in ("price_unit", "depth_unit", "multiplier_unit"))),
+        ("مهلت معامله / اعمال / تسویه", " / ".join(combined_value(row.get(key))
+                                                  for key in ("trade_cutoff_status", "exercise_status",
+                                                              "settlement_status"))),
+    ])
+    quotes = metrics([
+        ("bid مشاهده‌شده", combined_value(row.get("best_bid"))), ("ask مشاهده‌شده", combined_value(row.get("best_ask"))),
+        ("اسپرد", combined_value(row.get("spread_percent"), suffix="٪")),
+        ("عمق bid / ask", f'{combined_value(row.get("bid_volume"))} / {combined_value(row.get("ask_volume"))}'),
+        ("تعداد / حجم معامله", f'{combined_value(row.get("trade_count"))} / {combined_value(row.get("trade_volume"))}'),
+        ("اعمال / ضریب", f'{combined_value(row.get("strike_price"))} / {combined_value(row.get("contract_size"))}'),
+        ("تاریخ سررسید گزارش‌شده", display_date(expiry) if expiry else ltr("UNKNOWN")),
+    ])
+    status = row["status"]
+    return ('<article class="candidate-card combined-option"><header class="candidate-title">'
+            f'<h3>{combined_value(row.get("symbol"))}</h3>{ltr(row["option_type"])}{raw(row["ins_code"])}'
+            f'<span>پایه: {combined_value(row.get("underlying_symbol"))} {raw(row["underlying_code"])}</span></header>'
+            f'<p><strong>{h(research.COMBINED_STATUSES.get(status, "نامعلوم"))}</strong> · {ltr(status)} — '
+            f'{h(row["reason_fa"])} {raw(row["reason_code"])}</p>{quotes}'
+            f'<p>غربال اولیه: {h(screening)}<br>رتبه‌بندی سخت‌گیرانه: {h(rank)}</p>'
+            f'<details><summary>جزئیات فنی مشاهده</summary><div class="record-details">{details}</div></details></article>')
+
+
+def combined_underlying_card(code, group):
+    technical = group["technical_analysis"]
+    content = f'<p>{ltr(technical["status"])} — {h(technical["reason_fa"])} {raw(technical["reason_code"])}</p>'
+    if technical["status"] == "AVAILABLE" and technical.get("history"):
+        history = technical["history"]
+        indicators = []
+        for name, item in history["indicators"].items():
+            value = item.get("value")
+            if isinstance(value, dict):
+                display = " / ".join(f"{raw(key)}: {combined_value(number)}" for key, number in value.items())
+            else:
+                display = combined_value(value)
+            explanation = f' — {h(item["reason"])}' if item.get("reason") else ""
+            warmup = f' · {raw(item["warmup"])}' if item.get("warmup") else ""
+            indicators.append((name, f'{raw(item["status"])}: {display}{explanation}{warmup}'))
+        content += fields([
+            ("قیمت‌های پایانی قابل استفاده", combined_value(history["valid_close_count"])),
+            ("تاریخ برش انحصاری", raw(history["session_date_cutoff_exclusive"])),
+            ("تعدیل / کامل‌بودن جلسات", f'{raw(history["adjustment_status"])} / {raw(history["session_completeness"])}'),
+        ]) + ("<p>تاریخچه پس از ثبت اختیار دریافت شده است.</p>" if technical.get("downloaded_after_capture") else "")
+        content += '<details><summary>مشاهدات فنی — نه سیگنال</summary>' + fields(indicators) + "</details>"
+    types = group["option_counts"]
+    return (f'<article class="candidate-card combined-underlying"><h3>{shown("، ".join(group["symbols"]))} {raw(code)}</h3>'
+            f'<p>CALL: {shown(types["CALL"])} · PUT: {shown(types["PUT"])}</p>{content}</article>')
+
+
+def combined_diagnostic_card(row):
+    scope = "خارج از اختیارهای یکتا" if row["excluded_from_options"] else "برای اختیار دارای هویت یکتا"
+    return (f'<article class="candidate-card combined-diagnostic"><h3>ردیف خام {shown(row["raw_row"])} · {ltr(row["side"])}</h3>'
+            f'<p>{raw(row["status"])} · {h(scope)} — {h(row["reason_fa"])} {raw(row["reason_code"])}</p>'
+            + fields([("شناسهٔ اختیار", combined_value(row.get("ins_code"))),
+                      ("شناسهٔ پایه", combined_value(row.get("underlying_code"))),
+                      ("فیلدهای معیوب", raw("، ".join(row.get("fields", ())) or None))]) + "</article>")
+
+
+def combined_page(report, query):
+    capture, summary, counts = report["capture"], report["summary"], report["reconciliation"]
+    types, states, screening = summary["option_counts"], summary["research_counts"], summary["screening"]
+    totals = card_grid([
+        ("اختیار یکتا", summary["contract_count"]), ("CALL", types["CALL"]), ("PUT", types["PUT"]),
+        ("دارایی پایه", summary["underlying_count"]), ("پایه با تاریخچهٔ قابل استفاده", summary["technical_available_count"]),
+        ("عبور از غربال اولیه", screening["candidate_passes"] if screening["evaluated"] else "ارزیابی نشده"),
+        ("عبور از رتبه‌بندی سخت‌گیرانه", screening["strict_passes"] if screening["evaluated"] else "ارزیابی نشده"),
+        *((label, states[label]) for label in research.COMBINED_STATUSES),
+    ])
+    diagnostics = (f'<p>ردیف خام: {shown(counts["raw_paired_rows"])} · سمت خام: {shown(counts["raw_sides"])} · '
+                   f'سمت خالی: {shown(counts["empty_sides"])} · فقط تشخیصی: {shown(counts["diagnostic_only_sides"])} · '
+                   f'اختیار با هویت یکتا: {shown(counts["identified_unique_contracts"])} · '
+                   f'یافتهٔ تشخیصی: {shown(len(report["diagnostics"]))}</p>'
+                   + reasons("کدهای تشخیصی ثبت", counts["diagnostics_by_reason"], {}))
+    header = (f'<p><a href="/">بازگشت به مشاهدات آرشیوی</a></p>{COMBINED_WARNING}'
+              f'<p>ثبت ثابت {raw(capture["capture_id"])} · دریافت HTTP در تهران (نه زمان بورس): '
+              f'{display_receipt(capture["receipt_tehran"])}؛ زمان مظنه: {ltr("UNKNOWN")}</p>{totals}{diagnostics}'
+              '<details><summary>منشأ، یکپارچگی و محدودیت‌ها</summary>' + fields([
+                  *receipt_details(capture), ("ردهٔ داده", raw(capture["dataset_class"])),
+                  ("نشانی منبع", raw(capture["source_url"])), ("وضعیت غربال ثبت", raw(capture["screening_status"])),
+                  ("هش مهر", raw(capture["seal_sha256"])),
+              ]) + "<ul>" + "".join(f"<li>{h(note)}</li>" for note in report["limitations_fa"]) + "</ul></details>")
+
+    def link(**changes):
+        return h(COMBINED_RESEARCH + "?" + urlencode(vars(query) | changes))
+
+    tabs = '<nav class="pager" aria-label="بخش‌های پژوهش">' + "".join(
+        f'<a href="{link(view=view, page=1)}" aria-current="{"page" if view == query.view else "false"}">{h(label)}</a>'
+        for view, label in research.COMBINED_VIEWS.items()) + '</nav>'
+    rows, total, number, pages = research.combined_rows(report, query)
+    controls = ""
+    if query.view == "options":
+        controls = f'<form method="get" action="{COMBINED_RESEARCH}" class="filters">' + "".join(
+            f"<label>{label}{field}</label>" for label, field in (
+                ("جست‌وجوی نماد یا شناسهٔ اختیار یا پایه", f'<input name="q" maxlength="80" value="{h(query.q)}">'),
+                ("نوع", select_input("kind", {"": "همه", "CALL": "CALL", "PUT": "PUT"}, query.kind)),
+                ("وضعیت پژوهشی", select_input("status", {"": "همه", **research.COMBINED_STATUSES}, query.status)),
+                ("غربال اولیه", select_input("screening", {"": "همه", **research.COMBINED_SCREENING}, query.screening)),
+                ("نقدشوندگی ثبت‌شده", select_input("liquidity", {"": "همه", **research.COMBINED_LIQUIDITY}, query.liquidity)),
+                ("سررسید دقیق (میلادی)", f'<input name="expiry" type="date" value="{h(query.expiry)}">'),
+            )) + f'<div class="filter-actions"><button type="submit">اعمال فیلتر</button> <a href="{COMBINED_RESEARCH}">پاک‌کردن</a></div></form>'
+        cards = "".join(combined_option_card(row) for row in rows)
+    elif query.view == "underlyings":
+        cards = "".join(combined_underlying_card(code, group) for code, group in rows)
+    else:
+        cards = "".join(combined_diagnostic_card(row) for row in rows)
+    pager = '<nav class="pager" aria-label="صفحه‌بندی">' + "".join(
+        f'<a href="{link(page=target)}">{label}</a>'
+        for target, label in ((number - 1, "صفحهٔ قبل"), (number + 1, "صفحهٔ بعد"))
+        if 1 <= target <= pages) + "</nav>"
+    listing = f'<div class="candidate-grid">{cards}</div>' if cards else "<p>ردیفی برای نمایش نیست.</p>"
+    return page("پژوهش آرشیوی کل بازار", header + tabs + '<section>'
+                f'<h2>{h(research.COMBINED_VIEWS[query.view])}</h2>{controls}'
+                f'<p>{shown(total)} نتیجه · صفحهٔ {shown(number)} از {shown(pages)}</p>{listing}{pager}</section>')
+
+
 def home(store, observations, archive_failed, now, *, report=None, query=None):
     active, history = [], []
     current = store.current_fingerprints()
@@ -449,7 +600,8 @@ def home(store, observations, archive_failed, now, *, report=None, query=None):
                          + candidate_section(latest, comparison, query or research.Query())
                          + comparison_section(comparison))
     return page("داشبورد تأیید انسانی", f"""<p><a href="{PREFLIGHT}">بررسی پیش از سفارش</a> — برآورد دستی، فقط‌خواندنی</p>
-<h2>مشاهدات آرشیوی TSE/IFB</h2>
+ <h2>مشاهدات آرشیوی TSE/IFB</h2>
+ <p><a href="{COMBINED_RESEARCH}">پژوهش کل بازار برای ثبت آرشیوی {h(research.COMBINED_CAPTURE)}</a></p>
 <p>دریافت HTTP از TSETMC زمان مظنهٔ بورس نیست. زمان و توالی دفتر سفارش نامعلوم‌اند.
 این داده‌ها زنده، قابل اجرا یا مبنای پرشدن آزمایشی نیستند.</p>{card_grid(cards)}
 {research_html}
@@ -931,10 +1083,12 @@ class DashboardServer(HTTPServer):
         TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address
 
-    def __init__(self, port, store, observations, *, archive_failed=False, clock=utc_now, cache=None):
+    def __init__(self, port, store, observations, *, archive_failed=False, clock=utc_now,
+                 cache=None, combined_cache=None):
         self.store, self.observations, self.clock = store, observations, clock
         self.archive_failed = archive_failed
         self.cache = cache
+        self.combined_cache = combined_cache
         self.csrf = secrets.token_hex(32)
         super().__init__((HOST, port), DashboardHandler)
         self.authority = f"{HOST}:{self.server_port}"
@@ -996,6 +1150,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self.fail(403, "میزبان محلی معتبر نیست.")
         try:
             path, _, raw = self.path.partition("?")
+            if path == COMBINED_RESEARCH:
+                if (self.headers.get_all("Sec-Fetch-Site") not in (None, ["same-origin"], ["none"])
+                        or self.headers.get_all("Origin") not in (None, [self.server.origin])):
+                    return self.fail(403, "مبدأ درخواست معتبر نیست.")
+                try:
+                    query = research.CombinedQuery.parse(raw)
+                except ValueError:
+                    return self.fail(400, "فیلتر یا پارامتر پژوهشی نامعتبر است.")
+                cache = self.server.combined_cache
+                report = cache.get() if cache is not None else None
+                if report is None:
+                    return self.respond(503, page("پژوهش آرشیوی کل بازار", COMBINED_WARNING +
+                                                  "<p>گزارش ثبت در دسترس نیست. دادهٔ پیشین نمایش داده نمی‌شود.</p>"
+                                                  '<p><a href="/">بازگشت به مشاهدات آرشیوی</a></p>'))
+                return self.respond(200, combined_page(report, query))
             if path == "/":
                 try:
                     query = research.Query.parse(raw)
@@ -1084,7 +1253,8 @@ def main(argv=None):
         store = ApprovalStore(DB, phase1_eligible)
         store.initialize()
         store.reconcile()
-        with DashboardServer(args.port, store, [], cache=research.ArchiveCache()) as server:
+        with DashboardServer(args.port, store, [], cache=research.ArchiveCache(),
+                             combined_cache=research.CombinedCache()) as server:
             print(f"داشبورد پژوهشی: {server.origin}/", flush=True)
             server.serve_forever()
     except KeyboardInterrupt:

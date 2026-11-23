@@ -25,6 +25,8 @@ SIDE_FIELDS = {
     "best_bid": "pMeDem", "best_ask": "pMeOf", "bid_volume": "qTitMeDem",
     "ask_volume": "qTitMeOf", "trade_count": "zTotTran", "trade_volume": "qTotTran5J",
 }
+SIDE_EVIDENCE_FIELDS = (*SIDE_FIELDS.values(), "lVal18AFC", "lVal30", "pDrCotVal", "pClosing",
+                        "priceYesterday", "qTotCap", "notionalValue", "oP", "marketSameRiskOP")
 BASE_FIELDS = {"underlying_last_price": "pDrCotVal_UA", "underlying_closing_price": "pClosing_UA",
                "remaining_days": "remainedDay"}
 QUOTE_CLASSES = ("two_sided", "bid_only", "ask_only", "missing", "crossed", "inconsistent")
@@ -85,35 +87,135 @@ def inspect_contract(raw, side):
     }
 
 
+def absent_id(code):
+    return code is None or code in ("", "0") or (type(code) is int and code == 0)
+
+
+def contract_error(raw, side, code):
+    base, strike, expiry, size = (raw.get(k) for k in ("uaInsCode", "strikePrice", "endDate", "contractSize"))
+    if not watch.positive_id(code) or not watch.positive_id(base):
+        return "invalid_identifier", "invalid option or underlying ID"
+    if not all(number(v)[1] == "present" for v in (strike, size)):
+        return "invalid_strike_or_size", f"invalid strike/size: {code}"
+    try:
+        if not isinstance(expiry, str) or not re.fullmatch(r"[0-9]{8}", expiry):
+            raise ValueError
+        date.fromisoformat(f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}")
+    except ValueError:
+        return "invalid_expiry", f"invalid expiry: {code}"
+    if any(v is not None and not isinstance(v, str)
+           for v in (raw.get(f"lVal18AFC_{side}"), raw.get("lval30_UA"))):
+        return "invalid_symbol", f"invalid symbol: {code}"
+    return None
+
+
+def contract_row(raw, side, kind):
+    return {
+        "option_type": kind, "underlying_code": raw.get("uaInsCode"), "strike_price": raw.get("strikePrice"),
+        "maturity_date": raw.get("endDate"), "contract_size": raw.get("contractSize"),
+        "symbol": raw.get(f"lVal18AFC_{side}"), "underlying_symbol": raw.get("lval30_UA"),
+        **inspect_contract(raw, side),
+    }
+
+
 def raw_contracts(body):
     contracts = {}
     for raw in body:
         for side, kind in (("C", "CALL"), ("P", "PUT")):
             code = raw.get(f"insCode_{side}")
-            if code is None or code in ("", "0") or (type(code) is int and code == 0):
+            if absent_id(code):
                 continue
-            base, strike, expiry, size = (raw.get(k) for k in ("uaInsCode", "strikePrice", "endDate", "contractSize"))
-            watch.require(watch.positive_id(code) and watch.positive_id(base), "invalid option or underlying ID")
+            watch.require(watch.positive_id(code) and watch.positive_id(raw.get("uaInsCode")),
+                          "invalid option or underlying ID")
             watch.require(code not in contracts, f"duplicate instrument ID: {code}")
-            watch.require(all(number(v)[1] == "present" for v in (strike, size)), f"invalid strike/size: {code}")
-            try:
-                watch.require(isinstance(expiry, str) and re.fullmatch(r"[0-9]{8}", expiry), "invalid expiry")
-                date.fromisoformat(f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}")
-            except ValueError as error:
-                raise watch.ArchiveError(f"invalid expiry: {code}") from error
-            symbol, base_symbol = raw.get(f"lVal18AFC_{side}"), raw.get("lval30_UA")
-            watch.require(all(v is None or isinstance(v, str) for v in (symbol, base_symbol)), f"invalid symbol: {code}")
-            contracts[code] = {
-                "option_type": kind, "underlying_code": base, "strike_price": strike,
-                "maturity_date": expiry, "contract_size": size, "symbol": symbol,
-                "underlying_symbol": base_symbol, **inspect_contract(raw, side),
-            }
+            error = contract_error(raw, side, code)
+            if error:
+                raise watch.ArchiveError(error[1])
+            contracts[code] = contract_row(raw, side, kind)
     watch.require(contracts, "no identifiable option contracts")
     return contracts
 
 
 def identity(row):
     return tuple(row[key] for key in watch.IDENTITY)
+
+
+DIAGNOSTIC_REASONS = {
+    "invalid_raw_row": "ردیف خام شیء معتبر نیست؛ وجود قرارداد در این سمت معلوم نیست.",
+    "missing_option_id": "نشانهٔ قرارداد هست، اما شناسهٔ اختیار موجود نیست.",
+    "missing_underlying_id": "شناسهٔ پایه موجود نیست؛ نام نماد جایگزین شناسه نمی‌شود.",
+    "invalid_identifier": "شناسهٔ اختیار یا پایه نامعتبر است.",
+    "invalid_strike_or_size": "قیمت اعمال یا اندازهٔ قرارداد نامعتبر است.",
+    "invalid_expiry": "تاریخ سررسید نامعتبر است.",
+    "invalid_symbol": "نوع دادهٔ نماد نامعتبر است.",
+    "duplicate_option_id": "شناسهٔ اختیار با همان شرایط چند بار آمده است؛ ادغام نشد.",
+    "conflicting_option_id": "یک شناسهٔ اختیار با نوع، پایه یا شرایط متعارض آمده است؛ ادغام نشد.",
+    "pinned_identity_conflict": "هویت با کنترل موجود برای این شناسهٔ مشخص ناسازگار است.",
+    "invalid_numeric_fields": "فیلد عددی نامعتبر است؛ غربال ثبت انجام نشد.",
+}
+
+
+def inventory_contracts(body):
+    """Account for raw sides without turning an ambiguous occurrence into a contract."""
+    first_terms, repeated, conflicts = {}, set(), set()
+    base_symbols = defaultdict(set)
+    inventory, options, diagnostics, empty = [], {}, [], 0
+    for row_no, raw in enumerate(body, 1):
+        for side, kind in (("C", "CALL"), ("P", "PUT")):
+            obj = raw if isinstance(raw, dict) else {}
+            code, base = obj.get(f"insCode_{side}"), obj.get("uaInsCode")
+            symbol = obj.get("lval30_UA")
+            if watch.positive_id(base):
+                names = base_symbols[base]
+                if isinstance(symbol, str) and symbol:
+                    names.add(symbol)
+            position = {"raw_row": row_no, "side": side,
+                        "ins_code": code if type(code) in (str, int) else None,
+                        "underlying_code": base if type(base) in (str, int) else None}
+            terms = (kind, base, obj.get("strikePrice"), obj.get("endDate"), obj.get("contractSize"))
+            if not isinstance(raw, dict):
+                reason = "invalid_raw_row"
+            elif absent_id(code):
+                if not any(not absent_id(v) and not (type(v) is float and v == 0)
+                           for v in (obj.get(f"{key}_{side}") for key in SIDE_EVIDENCE_FIELDS)):
+                    empty += 1
+                    continue
+                reason = "missing_option_id"
+            elif watch.positive_id(code) and absent_id(base):
+                reason = "missing_underlying_id"
+            else:
+                error = contract_error(obj, side, code)
+                reason = error[0] if error else None
+                if reason is None and code in TARGETS and (base, obj.get("endDate"), kind) != (KHODRO, SERIES_EXPIRY, "CALL"):
+                    reason = "pinned_identity_conflict"
+            if watch.positive_id(code):
+                fingerprint = tuple((type(value), value) for value in terms)
+                if code in first_terms:
+                    repeated.add(code)
+                    if first_terms[code] != fingerprint:
+                        conflicts.add(code)
+                else:
+                    first_terms[code] = fingerprint
+            inventory.append((position, obj, kind, reason))
+
+    for position, raw, kind, reason in inventory:
+        code, side = position["ins_code"], position["side"]
+        if code in repeated:
+            reason = "conflicting_option_id" if code in conflicts else "duplicate_option_id"
+        if reason:
+            diagnostics.append(position | {"status": "UNKNOWN" if reason.startswith("missing_") else "REJECTED",
+                                           "reason_code": reason, "reason_fa": DIAGNOSTIC_REASONS[reason],
+                                           "excluded_from_options": True})
+            continue
+        observation = contract_row(raw, side, kind)
+        options[code] = observation | {key: position[key] for key in ("raw_row", "side")}
+        invalid = sorted(key for key, value in observation["field_status"].items() if value == "invalid")
+        if invalid:
+            reason = "invalid_numeric_fields"
+            diagnostics.append(position | {"status": "REJECTED", "reason_code": reason,
+                                           "reason_fa": DIAGNOSTIC_REASONS[reason], "fields": invalid,
+                                           "excluded_from_options": False})
+    return options, base_symbols, sorted(diagnostics, key=lambda d: (d["raw_row"], d["side"])), empty
 
 
 def summarize(rows, screening_available):
@@ -151,17 +253,20 @@ def summarize(rows, screening_available):
     }
 
 
-def read_capture(meta):
+def read_capture(meta, *, legacy=False, diagnostics=False):
     path = meta["path"]
     body, raw = watch.read_object(path, watch.MAX_BODY, meta["body_sha256"])
     body = body.get("instrumentOptMarketWatch")
-    watch.require(isinstance(body, list) and type(meta["rows"]) is int and len(body) == meta["rows"]
-                  and type(meta["byte_count"]) is int and len(raw) == meta["byte_count"] and body
-                  and all(isinstance(r, dict) for r in body), "body does not match receipt")
-    rows = raw_contracts(body)
+    rows_expected, bytes_expected = meta.get("rows"), meta.get("byte_count")
+    watch.require(isinstance(body, list) and type(rows_expected) is int and len(body) == rows_expected
+                  and type(bytes_expected) is int and len(raw) == bytes_expected and body
+                  and (diagnostics or all(isinstance(r, dict) for r in body)), "body does not match receipt")
+    rows, base_symbols, findings, empty = inventory_contracts(body) if diagnostics else (raw_contracts(body), {}, [], 0)
+    identity_blocked = any(d["excluded_from_options"] for d in findings)
     # The existing replay rejects malformed numeric values at snapshot level. Keep the
     # raw diagnostics, but don't invent a screening/ranking result for this capture.
-    available = not any("invalid" in row["field_status"].values() for row in rows.values())
+    available = bool(rows) and not identity_blocked and not any(
+        "invalid" in row["field_status"].values() for row in rows.values())
     states = watch.contract_states(path, meta) if available else None
     if states is not None:
         watch.require(states.keys() == rows.keys() and all(identity(states[k]) == identity(rows[k]) for k in rows),
@@ -174,9 +279,11 @@ def read_capture(meta):
         bases[row["underlying_code"]].append(row)
 
     groups = {}
-    for code, members in sorted(bases.items()):
+    for code in sorted(bases.keys() | base_symbols.keys()):
+        members = bases[code]
         groups[code] = {
-            "symbols": sorted({r["underlying_symbol"] for r in members if r["underlying_symbol"]}),
+            "symbols": sorted(base_symbols[code] if diagnostics else
+                              {r["underlying_symbol"] for r in members if r["underlying_symbol"]}),
             "reference_values": {
                 k: sorted({r[k] for r in members if r["field_status"][k] == "present"})
                 for k in ("underlying_last_price", "underlying_closing_price")
@@ -187,10 +294,14 @@ def read_capture(meta):
     for code in TARGETS.keys() & rows.keys():
         watch.require(rows[code]["underlying_code"] == KHODRO and rows[code]["maturity_date"] == SERIES_EXPIRY
                       and rows[code]["option_type"] == "CALL", f"unexpected identity for خودرو target: {code}")
-    return {
-        "capture_id": f"manual:{meta['sequence']}", "body_sha256": meta["body_sha256"], "seal_sha256": meta["head_sha256"],
+    status = ("not_evaluated_invalid_snapshot_identity" if identity_blocked else
+              "not_evaluated_no_contracts" if not rows else
+              "not_evaluated_invalid_snapshot_numeric_fields" if not available else "existing_replay")
+    result = {
+        "capture_id": f"legacy:{meta['attempt']}" if legacy else f"manual:{meta['sequence']}",
+        "body_sha256": meta["body_sha256"], "seal_sha256": None if legacy else meta["head_sha256"],
         **{key: meta[key] for key in ("receipt_tehran", "receipt_utc", *TIME_FIELDS)},
-        "screening_status": "existing_replay" if available else "not_evaluated_invalid_snapshot_numeric_fields",
+        "screening_status": status,
         "summary": summarize(rows.values(), available),
         "by_type": {k: summarize((r for r in rows.values() if r["option_type"] == k), available) for k in ("CALL", "PUT")},
         "by_underlying_id": groups,
@@ -202,6 +313,15 @@ def read_capture(meta):
         },
         "contracts_by_id": rows,
     }
+    if diagnostics:
+        excluded = sum(d["excluded_from_options"] for d in findings)
+        watch.require(len(body) * 2 == empty + excluded + len(rows), "option-side inventory does not reconcile")
+        result.update(diagnostics=findings, reconciliation={
+            "raw_paired_rows": len(body), "raw_sides": len(body) * 2, "empty_sides": empty,
+            "diagnostic_only_sides": excluded, "identified_unique_contracts": len(rows),
+            "diagnostics_by_reason": dict(Counter(d["reason_code"] for d in findings)),
+        })
+    return result
 
 
 def compare(old, new):

@@ -11,7 +11,10 @@ import stat
 import subprocess
 import unicodedata
 from urllib.parse import parse_qs
+from zoneinfo import ZoneInfoNotFoundError
 
+import combine_analysis as combined
+import greeks_evidence_registry as evidence
 import shadow_collector as collector
 import shadow_multiday
 import shadow_watch as watch
@@ -27,10 +30,41 @@ SORTS = {
 }
 STATUSES = {"passed": "عبور از غربال", "rejected": "رد در غربال", "all": "همهٔ قراردادها"}
 ARCHIVE_ERRORS = (OSError, ValueError, subprocess.TimeoutExpired)
+COMBINED_CAPTURE = "manual:2"
+COMBINED_ERRORS = (*ARCHIVE_ERRORS, ZoneInfoNotFoundError)
+COMBINED_VIEWS = {"options": "قراردادها", "underlyings": "دارایی‌های پایه", "diagnostics": "تشخیص داده"}
+COMBINED_STATUSES = {"RESEARCH_ONLY": "فقط پژوهش؛ نه سیگنال", "REJECTED": "ردشده", "UNKNOWN": "شاهد ناکافی"}
+COMBINED_SCREENING = {"passed": "عبور از غربال", "rejected": "رد در غربال", "unknown": "ارزیابی نشده"}
+COMBINED_LIQUIDITY = {
+    "observed": "دوطرفه، بدون ایراد ثبت‌شده", "limited": "محدود یا ناسازگار", "unknown": "نامعلوم",
+}
+COMBINED_CODE_FILES = (*watch.MODEL_FILES, "combine_analysis.py", "market_data_quality.py",
+                       "analyze_underlying_trends_v2.py", "greeks_evidence_registry.py",
+                       "shadow_watch.py", "shadow_collector.py")
 
 
 def text_key(value):
     return unicodedata.normalize("NFKC", value or "").strip().casefold().translate(PERSIAN_LETTERS)
+
+
+def query_values(raw, fields):
+    if len(raw) > 2048 or not raw.isascii() or re.search(r"%(?![0-9a-fA-F]{2})", raw):
+        raise ValueError("invalid query encoding or length")
+    values = parse_qs(raw, keep_blank_values=True, strict_parsing=True, max_num_fields=len(fields), errors="strict")
+    if values.keys() - fields.keys() or any(len(v) != 1 for v in values.values()):
+        raise ValueError("unknown or repeated query field")
+    return {key: value[0] for key, value in values.items()}
+
+
+def validate_search_text(value):
+    if len(value) > 80 or any(unicodedata.category(c).startswith("C") and c not in "\u200c\u200d" for c in value):
+        raise ValueError("invalid search text")
+
+
+def query_page(value):
+    if not re.fullmatch(r"[1-9][0-9]{0,4}", value):
+        raise ValueError("invalid page")
+    return int(value)
 
 
 @dataclass(frozen=True)
@@ -46,28 +80,86 @@ class Query:
 
     @classmethod
     def parse(cls, raw):
-        if len(raw) > 2048 or not raw.isascii() or re.search(r"%(?![0-9a-fA-F]{2})", raw):
-            raise ValueError("invalid query encoding or length")
-        values = parse_qs(raw, keep_blank_values=True, strict_parsing=True,
-                          max_num_fields=8, errors="strict")
-        if (values.keys() - cls.__dataclass_fields__.keys()
-                or any(len(v) != 1 for v in values.values())):
-            raise ValueError("unknown or repeated query field")
-        for value in (values.get(key, [""])[0] for key in ("q", "underlying")):
-            if len(value) > 80 or any(unicodedata.category(c).startswith("C") and c not in "\u200c\u200d"
-                                      for c in value):
-                raise ValueError("invalid search text")
-        query = cls(**{key: value[0] for key, value in values.items() if key != "page"})
+        values = query_values(raw, cls.__dataclass_fields__)
+        for key in ("q", "underlying"):
+            validate_search_text(values.get(key, ""))
+        query = cls(**(values | {"page": query_page(values.get("page", "1"))}))
         if (query.kind not in ("", "CALL", "PUT") or query.status not in STATUSES
                 or query.sort not in SORTS or query.order not in ("asc", "desc")):
             raise ValueError("invalid filter or sort")
         if query.spread and (not re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,6})?", query.spread)
                              or Decimal(query.spread) > 200):
             raise ValueError("invalid spread limit")
-        page, = values.get("page", ["1"])
-        if not re.fullmatch(r"[1-9][0-9]{0,4}", page):
-            raise ValueError("invalid page")
-        return cls(**(vars(query) | {"page": int(page)}))
+        return query
+
+
+@dataclass(frozen=True)
+class CombinedQuery:
+    q: str = ""
+    kind: str = ""
+    status: str = ""
+    screening: str = ""
+    liquidity: str = ""
+    expiry: str = ""
+    view: str = "options"
+    page: int = 1
+
+    @classmethod
+    def parse(cls, raw):
+        values = query_values(raw, cls.__dataclass_fields__)
+        validate_search_text(values.get("q", ""))
+        query = cls(**(values | {"page": query_page(values.get("page", "1"))}))
+        if (query.view not in COMBINED_VIEWS or query.kind not in ("", "CALL", "PUT")
+                or query.status not in ("", *COMBINED_STATUSES)
+                or query.screening not in ("", *COMBINED_SCREENING)
+                or query.liquidity not in ("", *COMBINED_LIQUIDITY)):
+            raise ValueError("invalid combined research filter")
+        if query.expiry and (not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", query.expiry)
+                             or date.fromisoformat(query.expiry).isoformat() != query.expiry):
+            raise ValueError("invalid expiry filter")
+        return query
+
+
+def combined_screening(option):
+    screened = (option.get("screening") or {}).get("candidate_eligible")
+    return "passed" if screened is True else "rejected" if screened is False else "unknown"
+
+
+def combined_liquidity(option):
+    quote, issues = option.get("quote_class"), option.get("liquidity_issues")
+    if quote in (None, "missing") or issues is None:
+        return "unknown"
+    return "observed" if quote == "two_sided" and not issues else "limited"
+
+
+def combined_rows(report, query):
+    """Select displayed rows only; no screening or research calculation here."""
+    if query.view == "underlyings":
+        rows = sorted(report["underlyings"].items())
+    elif query.view == "diagnostics":
+        rows = sorted(report["diagnostics"], key=lambda row: (row["raw_row"], row["side"]))
+    else:
+        term, expiry = text_key(query.q), query.expiry.replace("-", "")
+        rows = []
+        for row in report["options"]:
+            if ((query.kind and query.kind != row["option_type"])
+                    or (query.status and query.status != row["status"])
+                    or (query.screening and query.screening != combined_screening(row))
+                    or (query.liquidity and query.liquidity != combined_liquidity(row))
+                    or (expiry and expiry != row.get("maturity_date"))):
+                continue
+            if term:
+                base = report["underlyings"][row["underlying_code"]]
+                names = (row["ins_code"], row["underlying_code"], row.get("symbol"),
+                         row.get("underlying_symbol"), *base["symbols"])
+                if not any(term in text_key(name) for name in names):
+                    continue
+            rows.append(row)
+        rows.sort(key=lambda row: row["ins_code"])
+    total = len(rows)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    number = min(query.page, pages)
+    return rows[(number - 1) * PAGE_SIZE:number * PAGE_SIZE], total, number, pages
 
 
 def numeric(value):
@@ -165,6 +257,15 @@ def entries(root, limit):
     return paths
 
 
+def manual_file_stamps(stream):
+    with collector.locked(stream, exclusive=False):
+        for path in entries(stream, MAX_STREAM_RECORDS):
+            watch.require(collector.RECORD.fullmatch(path.name), "unexpected archive entry")
+            yield path.name, stamp(path, stat.S_ISDIR)
+            for child in entries(path, len(collector.FILES)):
+                yield child.name, stamp(child, stat.S_ISREG)
+
+
 class ArchiveCache:
     """Stat the bounded archive on GET; replay only on a changed generation."""
 
@@ -180,12 +281,7 @@ class ArchiveCache:
         if legacy is not None:
             result.extend((p.name, stamp(p, stat.S_ISREG)) for p in entries(self.legacy, 2 * watch.MAX_RECORDS + 1))
         if stream is not None:
-            with collector.locked(self.stream, exclusive=False):
-                for path in entries(self.stream, MAX_STREAM_RECORDS):
-                    watch.require(collector.RECORD.fullmatch(path.name), "unexpected archive entry")
-                    result.append((path.name, stamp(path, stat.S_ISDIR)))
-                    for child in entries(path, len(collector.FILES)):
-                        result.append((child.name, stamp(child, stat.S_ISREG)))
+            result.extend(manual_file_stamps(self.stream))
         result.extend(stamp(watch.ROOT / name, stat.S_ISREG) for name in watch.MODEL_FILES)
         return tuple(result)
 
@@ -214,3 +310,52 @@ class ArchiveCache:
                 day, report["days"][day], report["days"]) if day else None
             self.key, self.report = key, report
         return self.report, self.report is None
+
+
+class CombinedCache:
+    """One in-memory version-2 report for the fixed capture; loaded on explicit GET only."""
+
+    def __init__(self, stream=collector.STREAM, history_path=watch.ROOT / "data/underlying_history.json"):
+        self.stream, self.history_path = stream, history_path
+        self.key = self.report = None
+        try:
+            self.code_key = self.code_signature()
+        except COMBINED_ERRORS:
+            self.code_key = None
+
+    def code_signature(self):
+        return tuple(stamp(watch.ROOT / name, stat.S_ISREG) for name in COMBINED_CODE_FILES)
+
+    def signature(self):
+        # Imported Python modules cannot be safely hot-reloaded with the replay scripts.
+        watch.require(self.code_key is not None and self.code_key == self.code_signature(),
+                      "restart required after research code change")
+        return (stamp(self.stream, stat.S_ISDIR), *manual_file_stamps(self.stream),
+                stamp(self.history_path, stat.S_ISREG, optional=True), stamp(evidence.REGISTRY, stat.S_ISREG))
+
+    def get(self):
+        try:
+            key = self.signature()
+            if self.report is not None and key == self.key:
+                return self.report
+            self.key = self.report = None
+            report = combined.build_market_research_report(
+                COMBINED_CAPTURE, stream=self.stream, legacy_archive=watch.DEFAULT_ARCHIVE, history_path=self.history_path,
+            )
+            watch.require(isinstance(report, dict) and report.get("schema_version") == 2
+                          and all(isinstance(report.get(key), dict)
+                                  for key in ("capture", "summary", "underlyings", "reconciliation"))
+                          and all(isinstance(report.get(key), list)
+                                  for key in ("options", "diagnostics", "limitations_fa"))
+                          and report.get("research_only") is True
+                          and report.get("execution_eligible") is False and report.get("point_in_time_verified") is False
+                          and report["capture"].get("capture_id") == COMBINED_CAPTURE
+                          and report.get("greeks_assumption_status") == "experimental_unverified"
+                          and report.get("risk") == {"status": "UNKNOWN", "max_quantity": None},
+                          "unexpected combined research report")
+            watch.require(key == self.signature(), "combined research inputs changed during replay")
+        except COMBINED_ERRORS:
+            self.key = self.report = None
+            return None
+        self.key, self.report = key, report
+        return report

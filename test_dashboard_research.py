@@ -2,6 +2,7 @@
 
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from html.parser import HTMLParser
 from http.client import HTTPConnection
 import os
@@ -12,7 +13,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 from unittest.mock import Mock, patch
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import approval_dashboard as dashboard
 from approval_workflow import ApprovalStore
@@ -328,3 +329,268 @@ class ResearchHTTPTests(unittest.TestCase):
         future = self.get("/")[2]
         self.assertIn("ثبت مناسب برای مقایسه در دسترس نیست", future)
         self.assertNotIn("اختلاف شمارنده‌های گزارش‌شده", future)
+
+
+def full_market_fixture():
+    options, bases = [], {}
+    for i in range(23):
+        base = str(81000 + i)
+        tech = dict(status="NOT_AVAILABLE", reason_fa="تاریخچهٔ منطبق نیست", reason_code="history_id_not_found",
+                    history=None)
+        symbols = [f"پایه نمونه {i}"]
+        if i == 0:
+            symbols.append("<base-alias> نام تازه")
+            tech.update(status="AVAILABLE", reason_fa="صرفاً توصیفی", reason_code="retrospective_history",
+                        downloaded_after_capture=True, history={
+                            "valid_close_count": 5, "session_date_cutoff_exclusive": DAY,
+                            "adjustment_status": "UNKNOWN", "session_completeness": "UNKNOWN",
+                            "indicators": {"SMA(5)": {"status": "COMPUTED", "value": 123},
+                                           "MACD": {"status": "INSUFFICIENT_HISTORY", "reason": "<محدودیت>"}},
+                        })
+        group = []
+        for j, kind in enumerate(("CALL", "PUT")):
+            ins_code = str(90000 + 2 * i + j)
+            screen = dict(candidate_eligible=j == 0, candidate_rejection=None if j == 0 else "wide_spread",
+                          rank_eligible=False, rank_rejection="<rank>" if j == 0 else None,
+                          iv_status="ok" if j == 0 else None,
+                          greeks_assumption_status="experimental_unverified" if j == 0 else None)
+            opt = contract(ins_code=ins_code, underlying_code=base, underlying_symbol=symbols[0], option_type=kind,
+                           symbol="<script>alert(1)</script>" if i == j == 0 else f"اختیار نمونه {ins_code}",
+                           status="REJECTED" if j else "UNKNOWN" if i else "RESEARCH_ONLY",
+                           reason_code="wide_spread" if j else "history_id_not_found" if i else "descriptive_comparison",
+                           reason_fa="شرح پژوهشی <نشانه>", screening=screen, quote_class="two_sided",
+                           liquidity_issues=[] if j == 0 else ["trade_count_below_minimum_or_unusable"],
+                           price_unit="UNKNOWN", depth_unit="UNKNOWN", multiplier_unit="UNKNOWN",
+                           execution_eligible=False)
+            if i == 22 and j == 0:
+                opt.update(screening=None, quote_class="missing", best_bid=None, best_ask=None,
+                           spread_percent=None, bid_volume=None, ask_volume=None, trade_count=0,
+                           maturity_date="20270121")
+            group.append(opt)
+        bases[base] = dict(symbols=symbols, technical_analysis=tech) | research.combined.market_counts(group, True)
+        options.extend(group)
+    diagnostics = [dict(raw_row=24, side="C", ins_code=None, underlying_code="81000", status="UNKNOWN",
+                        reason_code="missing_option_id", reason_fa="<رکورد ناقص>",
+                        excluded_from_options=True)]
+    capture = observation(DAY, {}) | dict(capture_id=research.COMBINED_CAPTURE, dataset_class=watch.DATA_CLASS,
+                                          source_url=watch.SOURCE, screening_status="existing_replay", seal_sha256="a" * 64)
+    counts = research.combined.market_counts(options, True)
+    return dict(schema_version=2, research_only=True, execution_eligible=False, point_in_time_verified=False,
+                greeks_assumption_status="experimental_unverified", risk={"status": "UNKNOWN", "max_quantity": None},
+                options=list(reversed(options)), underlyings=bases, diagnostics=diagnostics,
+                limitations_fa=["زمان بورس <نامعلوم>"], capture=capture,
+                summary=counts | dict(contract_count=len(options), underlying_count=len(bases), technical_available_count=1),
+                reconciliation=dict(raw_paired_rows=24, raw_sides=48, empty_sides=1, diagnostic_only_sides=1,
+                                    identified_unique_contracts=len(options),
+                                    diagnostics_by_reason={"missing_option_id": 1}))
+
+
+class CombinedCacheFixture(unittest.TestCase):
+    def setUp(self):
+        scratch = TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.stream = self.root / "stream"
+        entry = self.stream / "00000002"
+        entry.mkdir(parents=True)
+        for name in collector.FILES:
+            (entry / name).write_text("fixture", encoding="utf-8")
+        self.body = entry / "body.raw.json"
+        self.history = self.root / "history.json"
+        self.registry = self.root / "registry.json"
+        for path in (self.history, self.registry):
+            path.write_text("fixture", encoding="utf-8")
+        registry = patch.object(research.evidence, "REGISTRY", self.registry)
+        registry.start()
+        self.addCleanup(registry.stop)
+        self.cache = research.CombinedCache(self.stream, self.history)
+
+
+class CombinedCacheTests(CombinedCacheFixture):
+    def test_one_report_and_invalidation_for_body_history_and_registry(self):
+        with patch.object(research.combined, "build_market_research_report", side_effect=lambda *a, **kw:
+                          full_market_fixture()) as build:
+            old = self.cache.get()
+            self.assertIs(self.cache.get(), old)
+            self.assertEqual(build.call_count, 1)
+            build.assert_called_with(research.COMBINED_CAPTURE, stream=self.stream,
+                                     legacy_archive=watch.DEFAULT_ARCHIVE, history_path=self.history)
+            for index, path in enumerate((self.body, self.history, self.registry), 2):
+                with self.subTest(path=path.name):
+                    before = path.stat()
+                    path.write_text("changed", encoding="utf-8")  # Same size, restore mtime.
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    new = self.cache.get()
+                    self.assertIsNot(new, old)
+                    self.assertIs(self.cache.get(), new)
+                    self.assertEqual(build.call_count, index)
+                    old = new
+            self.body.write_text("corrupt", encoding="utf-8")
+            build.side_effect = watch.ArchiveError("invalid archive")
+            self.assertIsNone(self.cache.get())
+            self.assertIsNone(self.cache.report)
+            build.side_effect = None
+            build.return_value = full_market_fixture() | {"execution_eligible": True}
+            self.assertIsNone(self.cache.get())
+            self.assertIsNone(self.cache.report)
+
+    def test_changes_during_build_are_not_cached_and_replay_code_requires_restart(self):
+        def changing(*args, **kwargs):
+            self.history.write_text("changed during replay", encoding="utf-8")
+            return full_market_fixture()
+
+        with patch.object(research.combined, "build_market_research_report", side_effect=changing) as build:
+            self.assertIsNone(self.cache.get())
+            self.assertIsNone(self.cache.key)
+            build.side_effect = None
+            build.return_value = full_market_fixture()
+            self.assertIs(self.cache.get(), build.return_value)
+            with patch.object(self.cache, "code_signature", return_value=("changed replay code",)):
+                self.assertIsNone(self.cache.get())
+                self.assertIsNone(self.cache.report)
+                self.assertEqual(build.call_count, 2)
+
+
+class CombinedResearchHTTPTests(CombinedCacheFixture):
+    def setUp(self):
+        super().setUp()
+        self.fixture = full_market_fixture()
+        self.store = Mock()
+        self.store.recent.return_value = []
+        self.store.current_fingerprints.return_value = {}
+        self.store.detail.return_value = (None, [])
+        self.build = self.start_patch(patch.object(research.combined, "build_market_research_report",
+                                                  return_value=self.fixture))
+        self.start_patch(patch("sqlite3.connect", side_effect=AssertionError("unexpected database access")))
+        self.start_patch(patch("urllib.request.urlopen", side_effect=AssertionError("unexpected network")))
+        self.start_patch(patch.object(collector, "fetch", side_effect=AssertionError("unexpected collection")))
+        self.start_patch(patch("paper_trading.PaperTrading.buy", side_effect=AssertionError("unexpected order")))
+        self.start_patch(patch("paper_trading.PaperTrading.sell", side_effect=AssertionError("unexpected order")))
+        self.start_patch(patch.object(research.combined, "atomic_write", side_effect=AssertionError("unexpected write")))
+        self.server = dashboard.DashboardServer(0, self.store, [], combined_cache=self.cache)
+        self.thread = Thread(target=self.server.serve_forever, kwargs={"poll_interval": .01})
+        self.thread.start()
+        self.addCleanup(self.stop)
+
+    def start_patch(self, guard):
+        self.addCleanup(guard.stop)
+        return guard.start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def http(self, path, method="GET", **headers):
+        with closing(HTTPConnection(*self.server.server_address, timeout=3)) as connection:
+            connection.request(method, path, headers=headers)
+            with connection.getresponse() as response:
+                return response.status, dict(response.getheaders()), response.read().decode()
+
+    def get(self, **query):
+        return self.http(dashboard.COMBINED_RESEARCH + ("?" + urlencode(query) if query else ""))
+
+    def ids(self, html):
+        return re.findall(r'<h3>.*?</h3><bdi dir="ltr">(?:CALL|PUT)</bdi>'
+                          r'<bdi class="technical-value" dir="ltr">([0-9]+)</bdi>', html)
+
+    def test_combined_route_is_explicit_and_does_not_touch_existing_routes_or_security(self):
+        home = self.http("/")[2]
+        self.assertEqual(home.count(f'href="{dashboard.COMBINED_RESEARCH}"'), 1)
+        self.assertEqual(self.http("/preflight")[0], 200)
+        self.assertEqual(self.http("/review/" + "0" * 32)[0], 404)
+        self.build.assert_not_called()
+        self.store.reset_mock()
+        path = dashboard.COMBINED_RESEARCH
+        self.assertEqual(self.http(path, Host="elsewhere.invalid")[0], 403)
+        self.assertEqual(self.http(path, **{"Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(self.http(path, Origin="null")[0], 403)
+        self.assertEqual(self.http(path, method="POST", Origin=self.server.origin)[0], 404)
+        self.assertEqual(self.http(path, method="PUT")[0], 501)
+        for query in ("capture=manual:3", "path=%2Ftmp", "q=a&q=b", "view=orders", "expiry=2026-02-30",
+                      "page=0", "status=BUY_READY", "screening=untrusted", "liquidity=anything", "q=%FF"):
+            with self.subTest(query=query):
+                self.assertEqual(self.http(path + "?" + query)[0], 400)
+        self.build.assert_not_called()
+        self.assertEqual(self.store.mock_calls, [])
+        status, headers, _ = self.http(path, **{"Sec-Fetch-Site": "none"})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+        self.assertEqual(self.server.server_address[0], "127.0.0.1")
+        self.assertEqual(self.store.mock_calls, [])
+
+    def test_combined_cards_counts_labels_and_persian_bounded_pagination(self):
+        snapshot = lambda: {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        original = snapshot()
+        status, _, html = self.get()
+        self.assertEqual(status, 200)
+        for text in ('lang="fa" dir="rtl"', "manual:2", "دریافت HTTP در تهران (نه زمان بورس)", "ARCHIVED / NOT LIVE",
+                     "point_in_time_verified=false", "experimental_unverified", "execution_eligible=false",
+                     "risk.max_quantity=UNKNOWN", "اختیار یکتا<strong>", "۴۶", "۲۳", "RESEARCH_ONLY", "REJECTED",
+                     "UNKNOWN", "فقط پژوهش؛ نه سیگنال", "غربال اولیه: عبور از غربال",
+                     "رتبه‌بندی سخت‌گیرانه: رد در رتبه‌بندی", "&lt;rank&gt;", "&lt;script&gt;", "wide_spread",
+                     "رد در غربال", "سمت خام", "missing_option_id"):
+            self.assertIn(text, html)
+        self.assertEqual(self.ids(html), [str(i) for i in range(90000, 90020)])
+        self.assertNotIn("<script>", html)
+        self.assertNotIn('method="post"', html)
+        self.assertNotIn("/preflight", html)
+        self.assertNotIn("/review/", html)
+        first = self.get(kind="CALL", screening="passed", liquidity="observed", expiry="2027-01-20")[2]
+        self.assertEqual(len(self.ids(first)), 20)
+        next_url = unescape(re.search(r'<a href="([^"]+)">صفحهٔ بعد</a>', first)[1])
+        params = parse_qs(urlsplit(next_url).query)
+        self.assertEqual(params, {"kind": ["CALL"], "screening": ["passed"], "liquidity": ["observed"],
+                                  "expiry": ["2027-01-20"], "view": ["options"], "page": ["2"]})
+        self.assertEqual(self.ids(self.http(next_url)[2]), ["90040", "90042"])
+        self.assertEqual(self.ids(self.get(page=99999)[2]), [str(i) for i in range(90040, 90046)])
+        self.build.assert_called_once()
+        self.assertEqual(self.store.mock_calls, [])
+        self.assertEqual(snapshot(), original)
+
+    def test_market_search_and_filters_keep_unknown_distinct(self):
+        for term, ids in (("81000", ["90000", "90001"]), ("نام تازه", ["90000", "90001"]),
+                          ("اختیار نمونه 90001", ["90001"]), ("90000", ["90000"])):
+            with self.subTest(term=term):
+                self.assertEqual(self.ids(self.get(q=term)[2]), ids)
+        self.assertEqual(self.ids(self.get(status="RESEARCH_ONLY")[2]), ["90000"])
+        self.assertEqual(self.ids(self.get(kind="PUT", status="REJECTED", screening="rejected", liquidity="limited",
+                                           q="81022")[2]), ["90045"])
+        missing = self.get(status="UNKNOWN", screening="unknown", liquidity="unknown", expiry="2027-01-21")[2]
+        self.assertEqual(self.ids(missing), ["90044"])
+        self.assertIn('bid مشاهده‌شده</dt><dd><bdi dir="ltr">UNKNOWN', missing)
+        self.assertIn('تعداد / حجم معامله</dt><dd><bdi class="number" dir="ltr">۰', missing)
+        self.assertIn("غربال اولیه: ارزیابی نشده", missing)
+        self.assertIn("رتبه‌بندی سخت‌گیرانه: ارزیابی نشده", missing)
+        self.build.assert_called_once()
+
+    def test_all_base_categories_and_diagnostics_are_browsable_without_replay(self):
+        first, second = (self.get(view="underlyings", page=p)[2] for p in (1, 2))
+        self.assertEqual(first.count('class="candidate-card combined-underlying"'), 20)
+        self.assertEqual(second.count('class="candidate-card combined-underlying"'), 3)
+        self.assertIn("&lt;base-alias&gt;", first)
+        self.assertIn("SMA(5)", first)
+        self.assertIn("&lt;محدودیت&gt;", first)
+        self.assertNotIn("SMA(5)", second)
+        self.assertEqual(first.count("NOT_AVAILABLE") + second.count("NOT_AVAILABLE"), 22)
+        for code in self.fixture["underlyings"]:
+            self.assertIn(f'>{code}</bdi>', first + second)
+        diag = self.get(view="diagnostics")[2]
+        self.assertIn("ردیف خام", diag)
+        self.assertIn("خارج از اختیارهای یکتا", diag)
+        self.assertIn("missing_option_id", diag)
+        self.assertIn("&lt;رکورد ناقص&gt;", diag)
+        self.assertIn("سقف تعداد نامعلوم", diag)
+        self.build.assert_called_once()
+
+    def test_integrity_failure_returns_unavailable_not_previous_rows(self):
+        self.assertEqual(self.get()[0], 200)
+        self.body.write_text("tampered", encoding="utf-8")
+        self.build.side_effect = watch.ArchiveError("sensitive path")
+        status, _, html = self.get()
+        self.assertEqual(status, 503)
+        self.assertIn("دادهٔ پیشین نمایش داده نمی‌شود", html)
+        self.assertNotIn("sensitive path", html)
+        self.assertEqual(self.ids(html), [])
+        self.assertIsNone(self.cache.report)
