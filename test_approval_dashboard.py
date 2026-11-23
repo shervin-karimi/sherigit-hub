@@ -1,10 +1,11 @@
 """Offline tests: the only sockets opened by this module are loopback HTTP."""
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
+from io import StringIO
 from os import stat_result
 from pathlib import Path
 import re
@@ -237,7 +238,8 @@ class DashboardHTTPTests(ApprovalFixture):
             "csrf": self.server.csrf, "instrument": "ضـخود۱۱۶۵", "symbol": "", "kind": "CALL", "expiry": "2026-02-01",
             "strike": "650", "strike_unit": "rial", "price_unit": "toman_unit", "cash_unit": "rial",
             "contract_size": "۱۰۰۰", "limit_price": "۹", "quantity": "٢", "fee": "31",
-            "initial_equity": "4000000", "committed": "10000", "cash": "200000",
+            "initial_equity": "4000000", "committed": "10000", "reserved": "0", "cash": "200000",
+            "max_loss": "80000",
             "observed_strike_unit": "", "strike_unit_source": "",
             "cash_settlement_date": "", "physical_settlement_date": "",
         }
@@ -280,13 +282,13 @@ class DashboardHTTPTests(ApprovalFixture):
             with self.subTest(label=label):
                 self.assertIn(f'<dt>{label}</dt><dd><bdi class="number" dir="ltr">{amount}</bdi></dd>', html)
         self.assertIn("غیرقابل اجرا", html)
-        self.assertNotIn('<ul role="alert">', html)
+        self.assertIn("برآورد بهای خرید با کارمزد برای تعداد واردشده از بودجهٔ مؤثر زیان بیشتر است.", html)
 
     def test_preflight_per_contract_does_not_multiply_again_and_keeps_large_integer(self):
         status, _, html = self.preflight_post({
             "kind": "PUT", "price_unit": "rial_contract", "limit_price": "9007199254740993",
             "quantity": "2", "fee": "7", "initial_equity": "999999999999999999",
-            "cash": "999999999999999999",
+            "cash": "999999999999999999", "max_loss": "19000000000000000",
         })
         self.assertEqual(status, 200)
         self.assertIn("۱۸٬۰۱۴٬۳۹۸٬۵۰۹٬۴۸۱٬۹۹۳ ریال", html)
@@ -329,8 +331,10 @@ class DashboardHTTPTests(ApprovalFixture):
             ("quantity", "تعداد قرارداد", "-2"),
             ("fee", "کارمزد کل خرید اعلام‌شده", "31 تومان"),
             ("initial_equity", "سرمایهٔ اولیه", "-1"),
-            ("committed", "بهای خرید باز و تعهد خریدهای دیگر", "1,000"),
+            ("committed", "بهای خرید موقعیت‌های باز", "1,000"),
+            ("reserved", "رزرو سفارش‌های باز", "-1"),
             ("cash", "وجه نقد در دسترس", "-1"),
+            ("max_loss", "حداکثر زیان کل قابل‌قبول", "-1"),
         ):
             for value in (None, "", invalid):
                 with self.subTest(name=name, value=value):
@@ -372,7 +376,8 @@ class DashboardHTTPTests(ApprovalFixture):
                 if notice:
                     self.assertIn(notice, html)
                 else:
-                    self.assertNotIn('<ul role="alert">', html)
+                    self.assertNotIn("تاریخ سررسید واردشده گذشته است", html)
+                    self.assertNotIn("سررسید نزدیک است", html)
 
     def test_preflight_allocation_and_cash_boundaries(self):
         for committed, fee, cash, notice in (
@@ -387,7 +392,8 @@ class DashboardHTTPTests(ApprovalFixture):
                 if notice:
                     self.assertIn(notice, html)
                 else:
-                    self.assertNotIn('<ul role="alert">', html)
+                    self.assertNotIn("از سقف 10٪", html)
+                    self.assertNotIn("از وجه نقد در دسترس واردشده بیشتر است", html)
                 self.assertIn("غیرقابل اجرا", html)
         status, _, html = self.preflight_post({"committed": "220001", "cash": "180030"})
         self.assertEqual(status, 200)
@@ -395,6 +401,176 @@ class DashboardHTTPTests(ApprovalFixture):
         self.assertIn("از سقف 10٪ سرمایهٔ اولیه بیشتر است", alerts)
         self.assertIn("از وجه نقد در دسترس واردشده بیشتر است", alerts)
         self.assertLess(html.index(alerts), html.index("جمع برآورد خرید با کارمزد"))
+
+    def sizing_form(self, **changes):
+        return {"fee_cap": "1000", "fee_cap_source": "broker", "fee_cap_ref": "fixture-tariff-v1",
+                "sizing_inputs_checked": "yes", "initial_equity": "20000000", "max_loss": "350000"} | changes
+
+    def sizing_result(self, html):
+        section, = re.findall(r'<section id="preflight-sizing">(.*?)</section>', html, re.S)
+        return section
+
+    def assert_rial_field(self, html, label, amount):
+        self.assertIn(f'<dt>{label}</dt><dd><bdi class="number" dir="ltr">{amount} ریال</bdi></dd>', html)
+
+    def test_preflight_risk_budget_below_at_and_above_initial_equity_cap(self):
+        for kind in ("CALL", "PUT"):
+            for budget, entered, effective, maximum, capped in (
+                ("181999", "۱۸۱٬۹۹۹", "۱۸۱٬۹۹۹", "۱", False),
+                ("182000", "۱۸۲٬۰۰۰", "۱۸۲٬۰۰۰", "۲", False),
+                ("999000", "۹۹۹٬۰۰۰", "۱۸۲٬۰۰۰", "۲", True),
+            ):
+                with self.subTest(kind=kind, budget=budget):
+                    status, _, html = self.preflight_post(self.sizing_form(
+                        kind=kind, initial_equity="9100000", cash="500000", max_loss=budget))
+                    self.assertEqual(status, 200)
+                    self.assert_rial_field(html, "حداکثر زیان کل واردشده", entered)
+                    self.assert_rial_field(html, "سقف سیاست زیان (2٪ سرمایهٔ اولیه، به ریال کامل)", "۱۸۲٬۰۰۰")
+                    self.assert_rial_field(html, "بودجهٔ مؤثر زیان", effective)
+                    self.assertIn(f'>{maximum} قرارداد</bdi>', self.sizing_result(html))
+                    warning = "<li>بودجهٔ زیان واردشده برای رعایت سقف 2٪ سرمایهٔ اولیه کاهش یافت.</li>"
+                    self.assertEqual(warning in html, capped)
+                    if capped:
+                        self.assertIn('lang="fa" dir="rtl"', html)
+                        self.assertIn(f'<ul role="alert">{warning}</ul>', html)
+
+    def test_preflight_risk_cap_floors_fractional_rials_without_float_rounding(self):
+        # The exact cap is 19,999,999,999,999,999.98; float arithmetic can admit one extra rial.
+        for premium, maximum, breach in (
+                ("19999999999999998", "۱", False), ("19999999999999999", "۰", True)):
+            with self.subTest(premium=premium):
+                status, _, html = self.preflight_post(self.sizing_form(
+                    initial_equity="999999999999999999", max_loss="20000000000000000",
+                    cash="40000000000000000", limit_price=premium, price_unit="rial_contract",
+                    fee="0", fee_cap="1", quantity="1"))
+                self.assertEqual(status, 200)
+                self.assert_rial_field(html, "بودجهٔ مؤثر زیان", "۱۹٬۹۹۹٬۹۹۹٬۹۹۹٬۹۹۹٬۹۹۹")
+                section = self.sizing_result(html)
+                self.assertIn(f'>{maximum} قرارداد</bdi>', section)
+                self.assertEqual("هشدار زیان" in section, breach)
+                self.assertEqual("هشدار تعداد" in section, breach)
+
+    def test_preflight_direct_post_flags_requested_risk_breach_even_without_fee_bound(self):
+        for fee_cap in ("1000", ""):
+            with self.subTest(fee_cap=fee_cap):
+                form = self.preflight_form() | self.sizing_form(
+                    initial_equity="4000000", max_loss="350000", limit_price="39000",
+                    price_unit="rial_contract", quantity="3", fee_cap=fee_cap)
+                status, headers, html = self.preflight_post(data=urlencode(form))
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertNotIn("Location", headers)
+                self.assert_rial_field(html, "بودجهٔ مؤثر زیان", "۸۰٬۰۰۰")
+                self.assert_rial_field(html, "جمع برآورد خرید با کارمزد", "۱۱۷٬۰۳۱")
+                self.assertIn("برآورد بهای خرید با کارمزد برای تعداد واردشده از بودجهٔ مؤثر زیان بیشتر است.", html)
+                section = self.sizing_result(html)
+                if fee_cap:
+                    self.assertIn(">۲ قرارداد</bdi>", section)
+                    self.assertIn("کران هزینهٔ خرید برای تعداد واردشده از بودجهٔ مؤثر زیان بیشتر است.", section)
+                else:
+                    self.assertIn("<dd><bdi dir=\"ltr\">UNKNOWN</bdi></dd>", section)
+                    self.assertNotIn("محدودیت تعیین‌کننده", section)
+                for override in ("&max_loss=80000", "&effective_loss_budget=350000", "&current_equity=20000000"):
+                    status, _, html = self.preflight_post(data=urlencode(form) + override)
+                    self.assertEqual(status, 400)
+                    self.assertNotIn('id="preflight-sizing"', html)
+
+    def test_preflight_risk_inputs_reject_nonfinite_and_unusable_costs(self):
+        for field in ("initial_equity", "max_loss", "limit_price", "fee", "fee_cap"):
+            for value in ("NaN", "Infinity", "-Infinity"):
+                with self.subTest(field=field, value=value):
+                    status, _, html = self.preflight_post(self.sizing_form(**{field: value}))
+                    self.assertEqual(status, 400)
+                    self.assertNotIn('id="preflight-sizing"', html)
+        status, _, html = self.preflight_post(self.sizing_form(
+            initial_equity="49", max_loss="1", limit_price="1", price_unit="rial_contract", fee="0", fee_cap="0"))
+        self.assertEqual(status, 200)
+        self.assert_rial_field(html, "بودجهٔ مؤثر زیان", "۰")
+        self.assertIn(">۰ قرارداد</bdi>", self.sizing_result(html))
+
+    def test_preflight_sizing_rounds_down_and_reports_binding_constraints(self):
+        cases = (
+            (dict(cash="272999"), "۲", "وجه نقد خالص"),
+            (dict(cash="300000", committed="1700000", reserved="27000"), "۳", "ماندهٔ سقف تجمیعی سرمایه، وجه نقد خالص، بودجهٔ مؤثر زیان"),
+            (dict(cash="400000", committed="1700000", reserved="27001"), "۲", "ماندهٔ سقف تجمیعی سرمایه"),
+            (dict(cash="400000", max_loss="181999"), "۱", "بودجهٔ مؤثر زیان"),
+            (dict(cash="200000", reserved="1760000"), "۲", "ماندهٔ سقف تجمیعی سرمایه، وجه نقد خالص"),
+        )
+        for inputs, maximum, binding in cases:
+            with self.subTest(inputs=inputs):
+                status, _, html = self.preflight_post(self.sizing_form(**inputs))
+                self.assertEqual(status, 200)
+                section = self.sizing_result(html)
+                self.assertIn("۹۱٬۰۰۰ ریال به‌ازای هر قرارداد", section)
+                self.assertIn("۱۸۲٬۰۰۰ ریال", section)
+                self.assertIn(f'>{maximum} قرارداد</bdi>', section)
+                self.assertIn(f"<dt>محدودیت تعیین‌کننده</dt><dd>{binding}</dd>", section)
+                self.assertIn("نه اندازهٔ پیشنهادی", section)
+
+    def test_preflight_sizing_uses_fee_bound_not_total_fee_or_average(self):
+        for fee, quantity, fee_cap in (("31", "2", "1000"), ("250", "1", "1000"), ("700", "3", "1000")):
+            with self.subTest(fee=fee, quantity=quantity):
+                status, _, html = self.preflight_post(self.sizing_form(
+                    fee=fee, quantity=quantity, fee_cap=fee_cap, cash="182000"))
+                self.assertEqual(status, 200)
+                self.assertIn(">۲ قرارداد</bdi>", self.sizing_result(html))
+        for inputs, reason in (
+            (dict(fee_cap=""), "کران هزینهٔ خرید یا منشأ مستند آن نامعلوم است"),
+            (dict(fee_cap_source=""), "کران هزینهٔ خرید یا منشأ مستند آن نامعلوم است"),
+            (dict(fee_cap_ref=""), "کران هزینهٔ خرید یا منشأ مستند آن نامعلوم است"),
+            (dict(fee_cap="15"), "کران هزینه با کارمزد اعلام‌شده"),
+        ):
+            with self.subTest(inputs=inputs):
+                status, _, html = self.preflight_post(self.sizing_form(**inputs))
+                self.assertEqual(status, 200)
+                section = self.sizing_result(html)
+                self.assertIn("UNKNOWN", section)
+                self.assertIn(reason, section)
+                self.assertNotIn("محدودیت تعیین‌کننده", section)
+                self.assertIn("۱۸۰٬۰۳۱ ریال", html)
+        status, _, html = self.preflight_post(self.sizing_form(
+            fee="0", fee_cap="0", cash="180000", price_unit="rial_contract", limit_price="90000"))
+        self.assertEqual(status, 200)
+        self.assertIn(">۲ قرارداد</bdi>", self.sizing_result(html))
+        self.assertIn("۹۰٬۰۰۰ ریال به‌ازای هر قرارداد", self.sizing_result(html))
+
+    def test_preflight_sizing_zero_depth_or_budget_and_unknown_depth(self):
+        for inputs, binding in (
+            (dict(cash="0"), "وجه نقد خالص"),
+            (dict(max_loss="90999"), "بودجهٔ مؤثر زیان"),
+            (dict(max_loss="0"), "بودجهٔ مؤثر زیان"),
+            (dict(committed="2000001"), "ماندهٔ سقف تجمیعی سرمایه"),
+            (dict(ask_depth="0"), "عمق فروش واردشده"),
+        ):
+            with self.subTest(inputs=inputs):
+                status, _, html = self.preflight_post(self.sizing_form(**inputs))
+                self.assertEqual(status, 200)
+                section = self.sizing_result(html)
+                self.assertIn(">۰ قرارداد</bdi>", section)
+                self.assertIn(f"<dt>محدودیت تعیین‌کننده</dt><dd>{binding}</dd>", section)
+                self.assertIn("علت سقف صفر", section)
+        for depth, expected in (("", "عمق در سقف محاسبه اعمال نشده است"), ("1", "هشدار تعداد")):
+            status, _, html = self.preflight_post(self.sizing_form(ask_depth=depth))
+            self.assertEqual(status, 200)
+            self.assertIn(expected, self.sizing_result(html))
+
+    def test_preflight_sizing_rejects_bad_inputs_and_withholds_unchecked_or_near_expiry(self):
+        for inputs in (dict(price_unit=""), dict(contract_size=""), dict(fee=""), dict(max_loss=""),
+                       dict(reserved=""), dict(cash=""), dict(fee_cap="-1"), dict(ask_depth="1.5"),
+                       dict(fee_cap_source="other"), dict(fee_cap_ref="<script>bad</script>"),
+                       dict(sizing_inputs_checked="maybe")):
+            with self.subTest(inputs=inputs):
+                status, _, html = self.preflight_post(self.sizing_form(**inputs))
+                self.assertEqual(status, 400)
+                self.assertNotIn('id="preflight-sizing"', html)
+                self.assertNotIn("<script>", html)
+        for inputs, reason in ((dict(sizing_inputs_checked=""), "اظهار نشده است"),
+                               (dict(expiry="2026-01-08"), "در افق 7 روز")):
+            status, _, html = self.preflight_post(self.sizing_form(**inputs))
+            self.assertEqual(status, 200)
+            section = self.sizing_result(html)
+            self.assertIn(reason, section)
+            self.assertNotIn("محدودیت تعیین‌کننده", section)
 
     def test_preflight_blocks_host_origin_csrf_xss_and_malformed_form(self):
         form = urlencode(self.preflight_form())
@@ -452,35 +628,93 @@ class DashboardHTTPTests(ApprovalFixture):
                     self.assertIn("مبدأ درخواست معتبر نیست", response.read().decode())
 
     def test_preflight_with_cached_match_never_accesses_approval_store_files_or_order_path(self):
-        self.cache_contracts()
+        self.cache_contracts({
+            "9007199254740993": self.archived_contract(),
+            "9007199254740992": self.archived_contract(symbol="طـخود1165", option_type="PUT"),
+        })
         before = self.db.read_bytes()
         original_files = set(self.db.parent.iterdir())
-        with patch("sqlite3.connect", side_effect=AssertionError("unexpected database access")), \
+        output = StringIO()
+        with redirect_stderr(output), redirect_stdout(output), \
+                patch("sqlite3.connect", side_effect=AssertionError("unexpected database access")), \
                 patch.object(Path, "open", side_effect=AssertionError("unexpected filesystem access")), \
                 patch("urllib.request.urlopen", side_effect=AssertionError("unexpected outbound request")), \
                 patch.object(self.store, "decide", side_effect=AssertionError("unexpected decision")), \
                 patch.object(dashboard.collector, "fetch", side_effect=AssertionError("unexpected market fetch")), \
                 patch("paper_trading.PaperTrading.buy", side_effect=AssertionError("unexpected buy")), \
                 patch("paper_trading.PaperTrading.sell", side_effect=AssertionError("unexpected sell")):
-            self.assertEqual(self.http("GET", "/preflight")[0], 200)
-            status, headers, html = self.preflight_post(
-                self.broker_contract(observed_strike_unit="rial", strike_unit_source="broker_screen",
-                                     cash_settlement_date="1405/11/06", physical_settlement_date="1405/11/07"),
-                headers={"Sec-Fetch-Site": "same-origin"})
+            status, _, page = self.http("GET", "/preflight")
+            self.assertEqual(status, 200)
+            self.assertIn("فقط خرید اختیار خرید یا اختیار فروش", page)
+            self.assertIn("یعنی موقعیت خرید اختیار فروش، نه فروش یا نوشتن آن", page)
+            self.assertIn("خروج است و در این فرم برآورد نمی‌شود", page)
+            self.assertIn('name="kind"', page)
+            self.assertIn('<option value="CALL">CALL</option>', page)
+            self.assertIn('<option value="PUT">PUT</option>', page)
+            self.assertNotIn("SELL_TO_OPEN", page)
+            self.assertNotRegex(page, r'name="(?:side|action|order_side|order_action|position_effect)"')
+            for kind, contract in (("CALL", self.broker_contract()), ("PUT", self.broker_contract(
+                    instrument="9007199254740992", symbol="طـخود1165", kind="PUT"))):
+                with self.subTest(kind=kind):
+                    status, headers, html = self.preflight_post(
+                        contract | self.sizing_form(max_loss="567890", initial_equity="9100000")
+                        | dict(observed_strike_unit="rial", strike_unit_source="broker_screen",
+                                        cash_settlement_date="1405/11/06", physical_settlement_date="1405/11/07"),
+                        headers={"Sec-Fetch-Site": "same-origin"})
+                    self.assertEqual(status, 200)
+                    self.assertEqual(self.comparison_statuses(html), ["MATCHED_OBSERVATIONAL"] * 6)
+                    self.assertEqual(self.evidence_statuses(html), ["MATCHED_OBSERVATIONAL", "UNKNOWN", "UNKNOWN"])
+                    self.assertIn("BUY_TO_OPEN", html)
+                    self.assertIn("۱۸۰٬۰۳۱ ریال", html)
+                    self.assertIn(">۲ قرارداد</bdi>", self.sizing_result(html))
+                    self.assert_rial_field(html, "بودجهٔ مؤثر زیان", "۱۸۲٬۰۰۰")
+                    self.assertNotIn("fixture-tariff-v1", html)
+                    self.assertIn("فقط پژوهش — حتی تطابق همهٔ ورودی‌ها مجوز معاملهٔ واقعی نیست.", html)
+                    self.assertNotIn("Location", headers)
+                    self.assertNotIn("/review/", html)
+                    for text in ("verified", "approved for trading", "execution ready", "trade-approved", "execution-ready"):
+                        self.assertNotIn(text, html.lower())
             self.assertEqual(self.preflight_post(headers={"Origin": "null"})[0], 403)
             blank = self.http("GET", "/preflight")[2]
             self.assertNotIn("9007199254740993", blank)
             self.assertNotIn("1405/11/06", blank)
-        self.assertEqual(status, 200)
-        self.assertEqual(self.comparison_statuses(html), ["MATCHED_OBSERVATIONAL"] * 6)
-        self.assertEqual(self.evidence_statuses(html), ["MATCHED_OBSERVATIONAL", "UNKNOWN", "UNKNOWN"])
-        self.assertIn("فقط پژوهش — حتی تطابق همهٔ ورودی‌ها مجوز معاملهٔ واقعی نیست.", html)
-        self.assertNotIn("Location", headers)
-        self.assertNotIn("/review/", html)
-        for text in ("verified", "approved for trading", "execution ready", "trade-approved", "execution-ready"):
-            self.assertNotIn(text, html.lower())
+            self.assertNotIn("fixture-tariff-v1", blank)
+            self.assertNotIn("۵۶۷٬۸۹۰", blank)
+        self.assertEqual(output.getvalue(), "")
         self.assertEqual(self.db.read_bytes(), before)
         self.assertEqual(set(self.db.parent.iterdir()), original_files)
+        self.assertEqual(self.audit(), [("PENDING", "system")])
+
+    def test_preflight_rejects_order_intent_fields_before_lookup_or_estimate(self):
+        self.server.cache = Mock()
+        self.server.cache.get.side_effect = AssertionError("unexpected archive lookup")
+        before = self.db.read_bytes()
+        form = {key: value for key, value in self.preflight_form().items()
+                if key not in dashboard.PREFLIGHT_EVIDENCE_FIELDS}
+        with patch.object(dashboard, "manual_contract", side_effect=AssertionError("unexpected parsing")), \
+                patch.object(dashboard, "preflight_checks", side_effect=AssertionError("unexpected estimate")), \
+                patch("sqlite3.connect", side_effect=AssertionError("unexpected database access")), \
+                patch.object(self.store, "decide", side_effect=AssertionError("unexpected decision")), \
+                patch.object(dashboard.collector, "fetch", side_effect=AssertionError("unexpected market fetch")), \
+                patch("paper_trading.PaperTrading.buy", side_effect=AssertionError("unexpected buy")), \
+                patch("paper_trading.PaperTrading.sell", side_effect=AssertionError("unexpected sell")):
+            for field, value in (("action", "SELL_TO_OPEN"), ("side", "SELL_TO_OPEN"),
+                                 ("order_action", "SELL_TO_OPEN"), ("order_side", "SELL"),
+                                 ("position_effect", "OPEN"), ("action", "SELL_TO_CLOSE"),
+                                 ("action", "BUY_TO_OPEN"), ("action", "unsupported")):
+                with self.subTest(field=field, value=value):
+                    status, headers, html = self.preflight_post(data=urlencode(form | {field: value}))
+                    self.assertEqual(status, 400)
+                    self.assertEqual(headers["Cache-Control"], "no-store")
+                    self.assertNotIn("Location", headers)
+                    self.assertIn("فرم نامعتبر یا ناقص است", html)
+                    self.assertNotIn("جمع برآورد خرید با کارمزد", html)
+        status, _, html = self.preflight_post({"kind": "SELL_TO_OPEN"})
+        self.assertEqual(status, 400)
+        self.assertIn("نوع قرارداد نامعتبر است", html)
+        self.assertNotIn("جمع برآورد خرید با کارمزد", html)
+        self.server.cache.get.assert_not_called()
+        self.assertEqual(self.db.read_bytes(), before)
         self.assertEqual(self.audit(), [("PENDING", "system")])
 
     def broker_contract(self, **changes):
@@ -509,6 +743,23 @@ class DashboardHTTPTests(ApprovalFixture):
     def evidence_statuses(self, html):
         return self.comparison_statuses(html, evidence=True)
 
+    def assert_preflight_mismatch_blocked(self, status, headers, html, *labels):
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Referrer-Policy"], "same-origin")
+        self.assertNotIn("Location", headers)
+        self.assertNotIn("/review/", html)
+        self.assertIn('<table class="contract-comparison">', html)
+        self.assertIn('class="identity-block"', html)
+        self.assertIn("<li>محاسبه متوقف شد؛ اختلاف صریح در: " + "، ".join(labels) + ".</li>", html)
+        self.assertIn("مجوز معاملهٔ واقعی نیست", html)
+        self.assertNotIn("برآورد دستی — غیرقابل اجرا", html)
+        self.assertNotIn('id="preflight-sizing"', html)
+        for label in ("بهای هر قرارداد، پیش از کارمزد", "بهای خرید به قیمت محدود، پیش از کارمزد",
+                      "کارمزد واردشده", "جمع برآورد خرید با کارمزد", "سقف تجمیعی سرمایه",
+                      "وجه نقد در دسترس واردشده"):
+            self.assertNotIn(f"<dt>{label}</dt>", html)
+
     def test_preflight_settlement_observations_do_not_use_archive_expiry_or_lookalike_fields(self):
         self.cache_contracts({"60210342490439455": self.archived_contract(
             maturity_date="20270127", strike_unit=None,
@@ -535,14 +786,12 @@ class DashboardHTTPTests(ApprovalFixture):
         ):
             with self.subTest(archive_unit=archive_unit):
                 self.cache_contracts({"9007199254740993": self.archived_contract(strike_unit=archive_unit)})
-                status, _, html = self.preflight_post(self.broker_contract(
+                status, headers, html = self.preflight_post(self.broker_contract(
                     strike_unit=entered_unit, observed_strike_unit=observed_unit, strike_unit_source="broker_screen"))
-                self.assertEqual(status, 400)
+                self.assert_preflight_mismatch_blocked(status, headers, html, "واحد اعمال؛ مشاهده و منشأ دستی")
                 self.assertEqual(self.comparison_statuses(html)[3], "UNKNOWN")
                 self.assertEqual(self.evidence_statuses(html), ["MISMATCH", "UNKNOWN", "UNKNOWN"])
                 self.assertIn(notice, html)
-                self.assertIn('class="identity-block"', html)
-                self.assertNotIn("جمع برآورد خرید با کارمزد", html)
 
     def test_preflight_optional_evidence_never_fills_missing_unit_or_provenance(self):
         self.cache_contracts()
@@ -561,7 +810,8 @@ class DashboardHTTPTests(ApprovalFixture):
         self.assertEqual(status, 400)
         self.assertEqual(self.evidence_statuses(html), ["UNKNOWN"] * 3)
         self.assertIn("واحد مشاهده‌شدهٔ قیمت اعمال: انتخاب نشده است", html)
-        required_only = {k: v for k, v in self.preflight_form().items() if k not in dashboard.PREFLIGHT_EVIDENCE_FIELDS}
+        required_only = {k: v for k, v in (self.preflight_form() | self.broker_contract()).items()
+                         if k not in dashboard.PREFLIGHT_EVIDENCE_FIELDS}
         self.assertEqual(self.preflight_post(data=urlencode(required_only))[0], 200)
 
     def test_preflight_rejects_malformed_jalali_dates_and_unsafe_evidence_without_echo(self):
@@ -597,17 +847,40 @@ class DashboardHTTPTests(ApprovalFixture):
 
     def test_preflight_reports_each_explicit_mismatch_and_blocks(self):
         self.cache_contracts()
-        for index, update in enumerate((
-                dict(instrument="9007199254740992"), dict(symbol="ضـخود1166"), dict(kind="PUT"),
-                dict(strike="651"), dict(expiry="2026-02-02"), dict(contract_size="2"),
-        )):
-            with self.subTest(update=update):
-                status, _, html = self.preflight_post(self.broker_contract(**update))
-                results = ["UNKNOWN" if index == 0 else "MATCHED_OBSERVATIONAL"] * 6
-                results[index] = "MISMATCH"
-                self.assertEqual(status, 200)
-                self.assertEqual(self.comparison_statuses(html), results)
-                self.assertIn('class="identity-block"', html)
+        before = self.db.read_bytes()
+        original_files = set(self.db.parent.iterdir())
+        with patch.object(dashboard, "preflight_checks", side_effect=AssertionError("unexpected estimate")), \
+                patch("sqlite3.connect", side_effect=AssertionError("unexpected database access")), \
+                patch.object(Path, "open", side_effect=AssertionError("unexpected filesystem access")), \
+                patch.object(self.store, "decide", side_effect=AssertionError("unexpected decision")), \
+                patch.object(dashboard.collector, "fetch", side_effect=AssertionError("unexpected market fetch")), \
+                patch("paper_trading.PaperTrading.buy", side_effect=AssertionError("unexpected buy")), \
+                patch("paper_trading.PaperTrading.sell", side_effect=AssertionError("unexpected sell")):
+            for index, (update, label) in enumerate((
+                    (dict(instrument="9007199254740992"), "شناسهٔ ابزار (insCode)"),
+                    (dict(symbol="ضـخود1166"), "نماد قرارداد"),
+                    (dict(kind="PUT"), "نوع اختیار"),
+                    (dict(strike="651"), "قیمت اعمال و واحد"),
+                    (dict(expiry="2026-02-02"), "سررسید (میلادی)"),
+                    (dict(contract_size="2"), "اندازهٔ قرارداد (واحد پایه در هر قرارداد)"),
+            )):
+                with self.subTest(update=update):
+                    status, headers, html = self.preflight_post(self.broker_contract(**update) | self.sizing_form())
+                    results = ["UNKNOWN" if index == 0 else "MATCHED_OBSERVATIONAL"] * 6
+                    results[index] = "MISMATCH"
+                    self.assertEqual(self.comparison_statuses(html), results)
+                    self.assert_preflight_mismatch_blocked(status, headers, html, label)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(set(self.db.parent.iterdir()), original_files)
+        self.assertEqual(self.audit(), [("PENDING", "system")])
+
+    def test_preflight_lists_all_mismatches_without_promoting_unknown_strike(self):
+        self.cache_contracts({"9007199254740993": self.archived_contract(strike_unit=None)})
+        status, headers, html = self.preflight_post(self.broker_contract(kind="PUT", strike="651", contract_size="2"))
+        self.assertEqual(self.comparison_statuses(html),
+                         ["MATCHED_OBSERVATIONAL"] * 2 + ["MISMATCH", "UNKNOWN", "MATCHED_OBSERVATIONAL", "MISMATCH"])
+        self.assert_preflight_mismatch_blocked(
+            status, headers, html, "نوع اختیار", "اندازهٔ قرارداد (واحد پایه در هر قرارداد)")
 
     def test_preflight_does_not_guess_strike_units_or_coerce_numeric_types(self):
         for unit, strike, broker_unit, expected_http in (
@@ -620,6 +893,9 @@ class DashboardHTTPTests(ApprovalFixture):
                 self.assertEqual(status, expected_http)
                 self.assertEqual(self.comparison_statuses(html),
                                  ["MATCHED_OBSERVATIONAL"] * 3 + ["UNKNOWN"] + ["MATCHED_OBSERVATIONAL"] * 2)
+                if expected_http == 200:
+                    self.assertIn("۱۸۰٬۰۳۱ ریال", html)
+                    self.assertIn("برآورد دستی — غیرقابل اجرا", html)
                 if unit is None:
                     self.assertIn("650 · واحد نامعلوم", html)
 
@@ -688,8 +964,8 @@ class DashboardHTTPTests(ApprovalFixture):
 
     def test_preflight_comparison_escapes_archive_symbol_and_rejects_malformed_manual_symbol(self):
         self.cache_contracts({"9007199254740993": self.archived_contract(symbol='"><script>archive</script>')})
-        status, _, html = self.preflight_post(self.broker_contract())
-        self.assertEqual(status, 200)
+        status, headers, html = self.preflight_post(self.broker_contract())
+        self.assert_preflight_mismatch_blocked(status, headers, html, "نماد قرارداد")
         self.assertIn("&quot;&gt;&lt;script&gt;archive&lt;/script&gt;", html)
         self.assertNotIn("<script>", html)
         for symbol in ('"><script>broker</script>', "a" * 41, "abc\u202e"):
@@ -698,6 +974,7 @@ class DashboardHTTPTests(ApprovalFixture):
                 self.assertEqual(status, 400)
                 self.assertIn("توقف بررسی هویت", html)
                 self.assertNotIn(symbol, html)
+                self.assertNotIn("جمع برآورد خرید با کارمزد", html)
 
     def test_review_headers_escaping_and_explicit_approval(self):
         status, headers, html = self.http("GET", self.url)

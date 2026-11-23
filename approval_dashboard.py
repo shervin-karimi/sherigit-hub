@@ -28,6 +28,7 @@ REVIEW = re.compile(r"/review/([0-9a-f]{32})")
 PREFLIGHT = "/preflight"
 MAX_FORM = 1024
 PREFLIGHT_MAX_FORM = 2048
+PREFLIGHT_LOSS_PERCENT = 2
 MANUAL_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 PREFLIGHT_PRICE_UNITS = {
     "rial_unit": ("ریال به‌ازای هر واحد پایه", 1, True),
@@ -49,10 +50,23 @@ PREFLIGHT_NUMBERS = {
     "quantity": "تعداد قرارداد",
     "fee": "کارمزد کل خرید اعلام‌شده (ریال)",
     "initial_equity": "سرمایهٔ اولیه (ریال)",
-    "committed": "بهای خرید باز و تعهد خریدهای دیگر (جمع، ریال)",
-    "cash": "وجه نقد در دسترس پس از کسر تعهدهای دیگر (ریال)",
+    "committed": "بهای خرید موقعیت‌های باز (ریال)",
+    "reserved": "رزرو سفارش‌های باز و سایر تعهدها، جدا از بهای موقعیت‌های باز (ریال)",
+    "cash": "وجه نقد در دسترس پس از کسر رزروها و تعهدها (ریال)",
+    "max_loss": "حداکثر زیان کل قابل‌قبول برای این معامله (ریال)",
 }
-PREFLIGHT_FIELDS = {"instrument", "symbol", "kind", "expiry", "strike_unit", "price_unit", "cash_unit", *PREFLIGHT_NUMBERS}
+PREFLIGHT_SIZING_NUMBERS = {
+    "fee_cap": "کران مجموع کارمزد و هزینه‌های الزامی خرید (ریال به‌ازای هر قرارداد)",
+    "ask_depth": "عمق فروش مستقل بررسی‌شده تا قیمت محدود (تعداد قرارداد؛ اختیاری)",
+}
+PREFLIGHT_FEE_SOURCES = {
+    "broker": "مستند کارگزار برای همهٔ تعدادهای مورد بررسی",
+    "official": "تعرفهٔ رسمیِ قابل‌اعمال برای همهٔ تعدادهای مورد بررسی",
+}
+# Preflight estimates purchases only; no side or action field is accepted.
+PREFLIGHT_FIELDS = {"instrument", "symbol", "kind", "expiry", "strike_unit", "price_unit", "cash_unit",
+                    "fee_cap_source", "fee_cap_ref", "sizing_inputs_checked",
+                    *PREFLIGHT_NUMBERS, *PREFLIGHT_SIZING_NUMBERS}
 PREFLIGHT_UNIT_LABELS = {
     "strike_unit": "واحد قیمت اعمال",
     "price_unit": "واحد و مبنای قیمت محدود خرید (پریمیوم)",
@@ -448,12 +462,13 @@ def home(store, observations, archive_failed, now, *, report=None, query=None):
 
 def manual_number(form, key):
     value = form[key].translate(MANUAL_DIGITS)
-    zero_allowed = key in ("fee", "committed", "cash")
+    label = (PREFLIGHT_NUMBERS | PREFLIGHT_SIZING_NUMBERS)[key]
+    zero_allowed = key in ("fee", "committed", "reserved", "cash", "max_loss", "fee_cap", "ask_depth")
     if not value:
-        raise ValueError(f"{PREFLIGHT_NUMBERS[key]}: وارد نشده است.")
+        raise ValueError(f"{label}: وارد نشده است.")
     if not re.fullmatch(r"(?:0|[1-9][0-9]{0,17})", value) or (value == "0" and not zero_allowed):
         allowed = "صفر فقط اگر مقدار واقعاً صفر است" if zero_allowed else "بزرگ‌تر از صفر"
-        raise ValueError(f"{PREFLIGHT_NUMBERS[key]}: عدد صحیح و بدون جداکننده لازم است ({allowed}).")
+        raise ValueError(f"{label}: عدد صحیح و بدون جداکننده لازم است ({allowed}).")
     return int(value)
 
 
@@ -507,7 +522,62 @@ def manual_contract(form):
     )
 
 
-def preflight_checks(form, now, contract, unit_conflict):
+def preflight_sizing(form, values, premium_per_contract, allocation_remaining, effective_loss_budget, days):
+    """Size using a documented upper bound on acquisition charges, not the entered order's fee."""
+    fee_cap = manual_number(form, "fee_cap") if form["fee_cap"] else None
+    depth = manual_number(form, "ask_depth") if form["ask_depth"] else None
+    source = form["fee_cap_source"]
+    reference = form["fee_cap_ref"]
+    checked = form["sizing_inputs_checked"]
+    if source and source not in PREFLIGHT_FEE_SOURCES:
+        raise ValueError("منشأ کران هزینهٔ خرید نامعتبر است.")
+    if reference and not re.fullmatch(r"\w[\w ./:\u200c-]{0,79}", reference):
+        raise ValueError("مرجع کران هزینهٔ خرید نامعتبر است؛ فقط شناسهٔ کوتاه و بدون اطلاعات حساب وارد کنید.")
+    if checked not in ("", "yes"):
+        raise ValueError("اظهار بررسی ورودی‌های سقف تعداد نامعتبر است.")
+    reasons = []
+    if not checked:
+        reasons.append("بررسی واحد، ضریب، وجه نقد خالص و تعهدها توسط اپراتور اظهار نشده است.")
+    if fee_cap is None or not source or not reference:
+        reasons.append("کران هزینهٔ خرید یا منشأ مستند آن نامعلوم است؛ کارمزد کلِ تعداد واردشده قابل تعمیم نیست.")
+    elif fee_cap * values["quantity"] < values["fee"]:
+        reasons.append("کران هزینه با کارمزد اعلام‌شده برای تعداد واردشده تعارض دارد.")
+    if days <= HOLD_DAYS:
+        reasons.append(f"سررسید گذشته یا در افق {HOLD_DAYS} روز تقویمی است.")
+
+    label = "حداکثر تعداد طبق محاسبهٔ ورودی‌ها"
+    items = [("عمق فروش", shown(depth, suffix=" قرارداد") if depth is not None else
+              f'{ltr("UNKNOWN")} — عمق در سقف محاسبه اعمال نشده است.')]
+    if reasons:
+        items += [(label, ltr("UNKNOWN")), ("علت نامعلوم بودن سقف", h(" ".join(reasons)))]
+    else:
+        cost = premium_per_contract + fee_cap
+        requested_cost_bound = cost * values["quantity"]
+        limits = {
+            "ماندهٔ سقف تجمیعی سرمایه": max(0, allocation_remaining) // cost,
+            "وجه نقد خالص": values["cash"] // cost,
+            "بودجهٔ مؤثر زیان": effective_loss_budget // cost,
+        }
+        if depth is not None:
+            limits["عمق فروش واردشده"] = depth
+        maximum = min(limits.values())
+        items += [
+            ("کران هزینهٔ خرید هر قرارداد", shown(cost, suffix=" ریال به‌ازای هر قرارداد")),
+            ("کران هزینهٔ خرید در معرض زیان برای تعداد واردشده", shown(requested_cost_bound, suffix=" ریال")),
+            (label, shown(maximum, suffix=" قرارداد")),
+            ("محدودیت تعیین‌کننده", h("، ".join(name for name, quantity in limits.items() if quantity == maximum))),
+        ]
+        if maximum == 0:
+            items.append(("علت سقف صفر", "حداقل یک محدودیت اجازهٔ خرید یک قرارداد را نمی‌دهد."))
+        if values["quantity"] > maximum:
+            items.append(("هشدار تعداد", "تعداد واردشده از سقف محاسبه‌شده بیشتر است."))
+        if requested_cost_bound > effective_loss_budget:
+            items.append(("هشدار زیان", "کران هزینهٔ خرید برای تعداد واردشده از بودجهٔ مؤثر زیان بیشتر است."))
+    return ('<section id="preflight-sizing"><h3>سقف تعداد — فقط پژوهشی، نه اندازهٔ پیشنهادی</h3>'
+            + fields(items) + "</section>")
+
+
+def preflight_checks(form, now, contract):
     """Pure arithmetic and warnings; no proposal or eligibility result."""
     instrument = contract["ins_code"] or contract["symbol"]
     if not instrument:
@@ -523,8 +593,6 @@ def preflight_checks(form, now, contract, unit_conflict):
             raise ValueError(f"{PREFLIGHT_UNIT_LABELS[key]}: انتخاب نشده است.")
         if form[key] not in supported:
             raise ValueError(f"{PREFLIGHT_UNIT_LABELS[key]}: نامعتبر یا مبهم است.")
-    if unit_conflict:
-        raise ValueError("واحد قیمت اعمال متعارض است؛ برآورد نمایش داده نمی‌شود.")
     if contract["observed_strike_unit"] and not contract["strike_unit_source"]:
         raise ValueError("منشأ دستی واحد مشاهده‌شدهٔ اعمال: انتخاب نشده است.")
     if contract["strike_unit_source"] and not contract["observed_strike_unit"]:
@@ -536,7 +604,10 @@ def preflight_checks(form, now, contract, unit_conflict):
         principal *= values["contract_size"]
     total = principal + values["fee"]
     cap = values["initial_equity"] * ALLOCATION_PERCENT // 100
-    committed = values["committed"]
+    # All costs and manual budgets are in whole rials; floor the policy cap, never round up.
+    policy_loss_cap = values["initial_equity"] * PREFLIGHT_LOSS_PERCENT // 100
+    effective_loss_budget = min(values["max_loss"], policy_loss_cap)
+    committed = values["committed"] + values["reserved"]
     days = (expiry - timestamp(now).astimezone(collector.TEHRAN).date()).days
     warnings = []
     if days < 0:
@@ -549,6 +620,12 @@ def preflight_checks(form, now, contract, unit_conflict):
         warnings.append(f"با احتساب کارمزد، برآورد از سقف {ALLOCATION_PERCENT}٪ بیشتر است؛ هشدار احتیاطی.")
     if total > values["cash"]:
         warnings.append("برآورد با کارمزد از وجه نقد در دسترس واردشده بیشتر است.")
+    if values["max_loss"] > policy_loss_cap:
+        warnings.append(f"بودجهٔ زیان واردشده برای رعایت سقف {PREFLIGHT_LOSS_PERCENT}٪ سرمایهٔ اولیه کاهش یافت.")
+    if total > effective_loss_budget:
+        warnings.append("برآورد بهای خرید با کارمزد برای تعداد واردشده از بودجهٔ مؤثر زیان بیشتر است.")
+    sizing = preflight_sizing(form, values, principal // values["quantity"], cap - committed,
+                              effective_loss_budget, days)
     return fields([
         ("شناسه یا نماد / نوع", f"{ltr(instrument.translate(MANUAL_DIGITS))} / {ltr(form['kind'])}"),
         ("قیمت اعمال", shown(values["strike"], suffix=" " + PREFLIGHT_STRIKE_UNITS[form["strike_unit"]])),
@@ -561,12 +638,17 @@ def preflight_checks(form, now, contract, unit_conflict):
         ("کارمزد واردشده", shown(values["fee"], suffix=" ریال")),
         ("جمع برآورد خرید با کارمزد", shown(total, suffix=" ریال")),
         ("سرمایهٔ اولیهٔ واردشده", shown(values["initial_equity"], suffix=" ریال")),
+        ("حداکثر زیان کل واردشده", shown(values["max_loss"], suffix=" ریال")),
+        (f"سقف سیاست زیان ({PREFLIGHT_LOSS_PERCENT}٪ سرمایهٔ اولیه، به ریال کامل)",
+         shown(policy_loss_cap, suffix=" ریال")),
+        ("بودجهٔ مؤثر زیان", shown(effective_loss_budget, suffix=" ریال")),
         ("سقف تجمیعی سرمایه", shown(cap, suffix=" ریال")),
-        ("بهای خرید باز و تعهدهای دیگرِ واردشده", shown(committed, suffix=" ریال")),
+        ("بهای خرید موقعیت‌های باز", shown(values["committed"], suffix=" ریال")),
+        ("رزروها و تعهدهای جداگانه", shown(values["reserved"], suffix=" ریال")),
         ("تعهدهای واردشده + بهای خرید (بدون کارمزد جدید)", shown(committed + principal, suffix=" ریال")),
         ("تعهدهای واردشده + بهای خرید با کارمزد (برآورد احتیاطی)", shown(committed + total, suffix=" ریال")),
         ("وجه نقد در دسترس واردشده", shown(values["cash"], suffix=" ریال")),
-    ]), warnings
+    ]) + sizing, warnings
 
 
 def comparison_observation(cache, now):
@@ -670,9 +752,9 @@ def contract_comparison(broker, latest, note):
     # archive schema. An expiry date or a lookalike field cannot substitute.
     rows.extend((f"{label} (شمسی)", broker[key], "در آرشیو نیست", unknown)
                 for key, label in PREFLIGHT_SETTLEMENT_DATES.items())
+    mismatches = [label for label, _, _, status in rows if status == mismatch]
     warning = ""
-    if (rows[0][3] != match or rows[2][3] != match or (symbol and rows[1][3] == unknown)
-            or any(status == mismatch for _, _, _, status in rows)):
+    if mismatches or rows[0][3] != match or rows[2][3] != match or (symbol and rows[1][3] == unknown):
         warning = ('<p class="identity-block"><strong>توقف بررسی: '
                    "هویت قرارداد نامعلوم است یا هویت/مشخصات اختلاف دارد.</strong> "
                    "پیش از هر اقدام، قرارداد و مشخصات را از مرجع رسمی بررسی کنید.</p>")
@@ -700,7 +782,7 @@ def contract_comparison(broker, latest, note):
     if note:
         notices.append(note)
     alerts = warning + ("<ul>" + "".join(f"<li>{h(message)}</li>" for message in notices) + "</ul>" if notices else "")
-    return unit_conflict, alerts, (receipt +
+    return mismatches, alerts, (receipt +
             '<table class="contract-comparison"><thead><tr>'
             '<th scope="col">فیلد</th><th scope="col">ورودی دستی اپراتور</th><th scope="col">مشاهدهٔ تاریخی TSETMC</th>'
             f'<th scope="col">نتیجه</th></tr></thead><tbody>{body}</tbody></table>')
@@ -724,8 +806,13 @@ def preflight_page(token, *, estimate=None, warnings=(), invalid=False, alerts="
         *(input_field(key, f"{label} از صفحهٔ ایزی‌تریدر (اختیاری، شمسی YYYY/MM/DD)", 10)
           for key, label in PREFLIGHT_SETTLEMENT_DATES.items()),
         choice("price_unit", PREFLIGHT_UNIT_LABELS["price_unit"], {k: v[0] for k, v in PREFLIGHT_PRICE_UNITS.items()}),
-        choice("cash_unit", PREFLIGHT_UNIT_LABELS["cash_unit"], {"rial": "همهٔ این چهار مبلغ به ریال وارد شده‌اند"}),
+        choice("cash_unit", PREFLIGHT_UNIT_LABELS["cash_unit"], {"rial": "همهٔ مبالغ حساب، زیان و هزینه به ریال‌اند"}),
         *(input_field(name, label, 18, "numeric") for name, label in PREFLIGHT_NUMBERS.items()),
+        *(input_field(name, label, 18, "numeric") for name, label in PREFLIGHT_SIZING_NUMBERS.items()),
+        choice("fee_cap_source", "منشأ کران هزینهٔ خرید", PREFLIGHT_FEE_SOURCES),
+        input_field("fee_cap_ref", "شناسه یا نسخهٔ سند کران هزینه (بدون اطلاعات حساب)", 80),
+        '<label><input type="checkbox" name="sizing_inputs_checked" value="yes"> '
+        'واحد پریمیوم، ضریب همان قرارداد، وجه نقد خالص و تعهدها را با منابع معتبر بررسی کرده‌ام.</label>',
     ))
     result = ""
     if invalid or estimate is not None:
@@ -740,13 +827,28 @@ def preflight_page(token, *, estimate=None, warnings=(), invalid=False, alerts="
                         f'{alerts}</section>' if alerts else "")
     return page("بررسی پیش از سفارش", f"""<p><a href="/">بازگشت به داشبورد</a></p>
 <section><p><strong>فقط پژوهش — حتی تطابق همهٔ ورودی‌ها مجوز معاملهٔ واقعی نیست.</strong></p>
+<p><strong>راهبرد اولیه: فقط خرید اختیار خرید یا اختیار فروش برای باز کردن موقعیت خرید.</strong>
+این فرم فقط هزینهٔ خرید <bdi dir="ltr">BUY_TO_OPEN</bdi> برای <bdi dir="ltr">CALL</bdi> یا <bdi dir="ltr">PUT</bdi>
+را برآورد می‌کند. خرید <bdi dir="ltr">PUT</bdi> یعنی موقعیت خرید اختیار فروش، نه فروش یا نوشتن آن.
+فروش برای باز کردن موقعیت، موقعیت فروش بدون پوشش، راهبرد اعتباری و معامله با اعتبار مجاز نیستند.
+فروش برای بستن موقعیت خرید موجود (<bdi dir="ltr">SELL_TO_CLOSE</bdi>) خروج است و در این فرم برآورد نمی‌شود.</p>
 <p>فقط اعداد مشاهده‌شده در ایزی‌تریدر را دستی وارد کنید. دادهٔ دستی یا اسکرین‌شات مظنهٔ تأییدشده نیست.
 زمان معتبر مظنه، منشأ مستقل و مشخصات رسمی قرارداد بررسی نمی‌شوند؛ این صفحه مجوز یا مسیر ارسال سفارش ندارد.</p>
 <p>عدد صحیح و بدون جداکننده وارد کنید؛ واحد نامعلوم را حدس نزنید. رمز، اطلاعات حساب یا شناسهٔ سفارش وارد نکنید.
  کارمزد، مبلغ کل اعلام‌شده برای همین تعداد است، نه درصد یا کارمزد هر قرارداد؛ اگر نامعلوم است خالی بگذارید.
- کارمزد، سرمایه، تعهد و نقد را فقط به ریال وارد کنید؛ فرم این چهار مبلغ را تبدیل نمی‌کند.
+ مبالغ حساب، سقف زیان و هزینه‌ها را به ریال وارد کنید. بهای موقعیت‌های باز و رزروها را جدا وارد کنید.
+ نقد باید پس از کسر رزروها باشد؛ فرم رزروها را فقط در سقف تجمیعی لحاظ می‌کند و دوباره از نقد کم نمی‌کند.
+ موجودی و شواهد دستی مستقلاً توسط داشبورد تأیید نمی‌شوند.
  فقط برای پریمیومِ واردشده با واحد تومان، هر تومان برابر ۱۰ ریال است.
 برای قیمتِ هر قرارداد، ضریب دوباره ضرب نمی‌شود؛ با این حال اندازهٔ قرارداد باید معلوم باشد.</p>
+<p>حداکثر زیان کل را خودتان وارد کنید؛ پیش‌فرض ندارد. بودجهٔ مؤثر زیان هر معامله از مقدار واردشده و
+سقف {PREFLIGHT_LOSS_PERCENT}٪ سرمایهٔ اولیه، هرکدام کمتر باشد، به دست می‌آید و از سقف تجمیعی خرید جداست.
+برای سقف تعداد، کران هزینهٔ هر قرارداد باید
+برای هر تعدادِ مورد بررسی همهٔ کارمزدها، حداقل کارمزد، گردکردن و سایر هزینه‌های الزامی خرید را پوشش دهد.
+کارمزد یک سفارش یا تقسیم آن بر تعداد، به‌تنهایی شاهد چنین کرانی نیست. صفر فقط در صورت مستند بودن وارد شود.
+عمق را فقط اگر برای همین شناسه، در مظنهٔ معتبر و تا قیمت محدود مستقلاً بررسی شده است وارد کنید؛ از آرشیو پر نمی‌شود.</p>
+<p>کل هزینهٔ خرید در معرض زیان است؛ دستور حد ضرر تضمین خروج یا محدود کردن زیان نیست.
+الزامات اضافهٔ اعمال، تسویه یا تحویل تا تأیید مستقل <bdi dir="ltr">UNKNOWN</bdi> هستند و در این محاسبه نیستند.</p>
 <p>سقف تجمیعی {ALLOCATION_PERCENT}٪ سرمایهٔ اولیه و افق {HOLD_DAYS} روز تقویمی بررسی می‌شوند.
 تاریخ سررسید ساعت توقف معامله نیست. محاسبه از تاریخ دستگاه در تهران است و برای اجرا معتبر نیست.</p></section>
  {result + archive_warnings if invalid else archive_warnings + result}
@@ -773,7 +875,8 @@ def preflight_page(token, *, estimate=None, warnings=(), invalid=False, alerts="
   کنترل تاریخ شمسی فقط قالب و دامنهٔ ممکن ماه/روز است؛ کبیسه و برابری تقویمی احراز نشده‌اند.</p>
  {comparison}
  <p><bdi dir="ltr">MATCHED_OBSERVATIONAL</bdi>: تطابق در آرشیو، بدون تأیید مستقل؛
- <bdi dir="ltr">MISMATCH</bdi>: اختلاف صریح؛ <bdi dir="ltr">UNKNOWN</bdi>: داده، منشأ یا واحد کافی نیست.
+  <bdi dir="ltr">MISMATCH</bdi>: اختلاف صریح؛ محاسبه متوقف می‌شود.
+  <bdi dir="ltr">UNKNOWN</bdi>: داده، منشأ یا واحد کافی نیست.
  واحدهای متفاوت قیمت اعمال بدون مدرک تبدیل مقایسه نمی‌شوند؛ هیچ تبدیل ضمنی انجام نمی‌شود.</p></section>""")
 
 
@@ -943,9 +1046,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return self.respond(400, preflight_page(self.server.csrf, warnings=[str(error)], invalid=True))
             now = self.server.clock()
             latest, note = comparison_observation(self.server.cache, now)
-            unit_conflict, alerts, comparison = contract_comparison(contract, latest, note)
+            mismatches, alerts, comparison = contract_comparison(contract, latest, note)
+            if mismatches:
+                warning = "محاسبه متوقف شد؛ اختلاف صریح در: " + "، ".join(mismatches) + "."
+                return self.respond(400, preflight_page(self.server.csrf, warnings=[warning], invalid=True,
+                                                        alerts=alerts, comparison=comparison))
             try:
-                estimate, warnings = preflight_checks(form, now, contract, unit_conflict)
+                estimate, warnings = preflight_checks(form, now, contract)
             except ValueError as error:
                 return self.respond(400, preflight_page(self.server.csrf, warnings=[str(error)], invalid=True,
                                                         alerts=alerts, comparison=comparison))
