@@ -515,7 +515,139 @@ def market_counts(options, screening_available):
     }
 
 
-def build_market_research_report(capture_id, *, stream, legacy_archive, history_path):
+CSV_OVERLAY_FLAGS = {
+    "--history-csv": "source",
+    "--history-csv-ins-code": "code",
+    "--history-csv-sha256": "source_sha256",
+    "--history-csv-instrument-url": "instrument_page_url",
+    "--history-csv-close-policy": "close_policy",
+}
+CSV_OVERLAY_REQUIRED = set(CSV_OVERLAY_FLAGS.values()) - {"close_policy"}
+
+
+class CSVOverlayField(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        fields = getattr(namespace, self.dest) or []
+        fields.append((CSV_OVERLAY_FLAGS[option_string], value))
+        setattr(namespace, self.dest, fields)
+
+
+def csv_argument_groups(fields):
+    if not fields:
+        return ()
+    multiple = sum(key == "source" for key, _ in fields) > 1
+    groups, group = [], {}
+    for key, value in fields:
+        if multiple and key == "source" and group:
+            groups.append(group)
+            group = {}
+        if key in group or (multiple and key != "source" and "source" not in group):
+            raise ValueError("هر گروه CSV باید مستقل و کامل باشد و در اجرای چندفایلی با --history-csv آغاز شود.")
+        group[key] = value
+    groups.append(group)
+    if any(not CSV_OVERLAY_REQUIRED <= entry.keys() for entry in groups):
+        raise ValueError("در هر گروه CSV، هر چهار پرچم --history-csv باید دقیقاً یک‌بار داده شوند.")
+    return tuple(groups)
+
+
+def csv_overlay_history(indexed, overlay, bases, capture, receipt):
+    import analyze_underlying_trends_v2 as trends
+    import fetch_underlying_history as fetch
+    import shadow_watch as watch
+
+    digest, _, index, _ = indexed
+    code = overlay["code"]
+    watch.require(code not in index, "CSV overlay conflicts with a stored history instrument ID")
+    observation = fetch.csv_research_observation(**overlay, capture=capture, bases=bases)
+    watch.require(not any(fetch.name_key(observation.key) == fetch.name_key(name)
+                          for entries in index.values() for name, _ in entries),
+                  "CSV overlay conflicts with a stored history display name")
+    item = observation.entry()
+    report = trends.research_report(observation.key, item, {}, before=receipt.date(),
+                                    expected_code=code, preview_unknown_csv_receipt=True)
+    computed = any(metric["status"] == "COMPUTED" for metric in report["indicators"].values())
+    technical = {
+        "ins_code": code, "symbol": observation.key, "history": report, "history_sha256": None,
+        "downloaded_after_capture": None,
+        **(research_status("RESEARCH_ONLY", "csv_research_overlay", "تاریخچهٔ دستی فقط برای پژوهش توصیفی است.")
+           if computed else research_status("UNKNOWN", "insufficient_history",
+                                            "مشاهدهٔ قابل استفاده برای محاسبهٔ شاخص کافی نیست.")),
+    }
+    provenance = {
+        "ins_code": code, "status": "RESEARCH_ONLY", "stored_history_sha256": digest,
+        "csv": item["provenance"], "csv_received_at": item["fetched_at"],
+        "record_count": item["record_count"], "quality": item["quality"],
+        "session_date_cutoff_exclusive": report["session_date_cutoff_exclusive"],
+        "valid_closes_before_cutoff": report["valid_close_count"],
+        "excluded_at_or_after_cutoff": report["excluded_at_or_after_cutoff"],
+        "point_in_time_verified": False, "execution_eligible": False,
+    }
+    if "close_filter" in item:
+        cutoff = report["session_date_cutoff_exclusive"]
+        cutoff_number = int(cutoff.replace("-", ""))
+        before_count = sum(row["session_date"] < cutoff for row in item["close_filter"]["flagged_rows"])
+        after_count = item["close_filter"]["flagged_row_count"] - before_count
+        watch.require(report["valid_close_count"] >= fetch.REQUIRED_HISTORY,
+                      "fewer than 21 active sessions before cutoff after close policy")
+        # The analyzer sees only the filtered series; report source counts separately.
+        report["series_basis"] = item["close_filter"]["series_basis"]
+        provenance["close_filter"] = item["close_filter"] | {
+            "flagged_before_cutoff_count": before_count,
+            "source_records_before_cutoff": report["records_before_cutoff"] + before_count,
+            "source_active_before_cutoff": report["valid_close_count"] + before_count,
+            "indicator_eligible_before_cutoff": report["valid_close_count"],
+            "source_records_at_or_after_cutoff": report["excluded_at_or_after_cutoff"] + after_count,
+            "source_active_at_or_after_cutoff": after_count + sum(
+                row["dEven"] >= cutoff_number and row["qTotTran5J"] > 0 for row in item["history"]
+            ),
+        }
+    return technical, provenance
+
+
+def market_csv_overlays(indexed, overlays, observed, capture, receipt):
+    import fetch_underlying_history as fetch
+    import shadow_watch as watch
+
+    overlays = tuple(overlays)
+    _, _, _, error = indexed
+    watch.require(error is None, "valid stored history index required to rule out CSV series conflicts")
+    bases = {key: group["symbols"] for key, group in observed["by_underlying_id"].items()}
+    codes, hashes, paths = set(), set(), set()
+    for overlay in overlays:
+        watch.require(isinstance(overlay, dict) and CSV_OVERLAY_REQUIRED <= overlay.keys()
+                      <= set(CSV_OVERLAY_FLAGS.values()), "invalid CSV overlay fields")
+        watch.require(overlay.get("close_policy", "strict") in fetch.CSV_CLOSE_POLICIES, "invalid CSV close policy")
+        code, digest, source = (overlay[key] for key in ("code", "source_sha256", "source"))
+        watch.require(watch.positive_id(code), "invalid stable instrument ID")
+        watch.require(code not in codes, f"duplicate CSV overlay instrument ID: {code}")
+        watch.require(fetch.is_sha256(digest), f"invalid expected provider SHA-256: {code}")
+        watch.require(isinstance(source, (str, Path)) and source, f"invalid CSV path: {code}")
+        path = Path(source).absolute()
+        watch.require(digest not in hashes and path not in paths, f"duplicate CSV overlay source (path or hash): {code}")
+        codes.add(code)
+        hashes.add(digest)
+        paths.add(path)
+    technical, provenance, tickers, size = {}, {}, set(), 0
+    capture = capture | {"diagnostics": observed["diagnostics"]}
+    for overlay in sorted(overlays, key=lambda entry: entry["code"]):
+        code = overlay["code"]
+        try:
+            analysis, evidence = csv_overlay_history(indexed, overlay, bases, capture, receipt)
+            size += evidence["csv"]["byte_count"]
+            watch.require(size <= watch.MAX_BODY, "combined CSV inputs exceed size limit")
+            ticker = fetch.name_key(evidence["csv"]["ticker"])
+            watch.require(ticker not in tickers, "conflicting CSV ticker across distinct instrument IDs")
+        except (OSError, ValueError, ArithmeticError) as error:
+            raise ValueError(f"CSV overlay {code}: {error}") from error
+        tickers.add(ticker)
+        technical[code], provenance[code] = analysis, evidence
+    if any("close_policy" in overlay for overlay in overlays):
+        for overlay in overlays:
+            provenance[overlay["code"]]["close_policy"] = overlay.get("close_policy", "strict")
+    return technical, provenance
+
+
+def build_market_research_report(capture_id, *, stream, legacy_archive, history_path, csv_overlay=None, csv_overlays=()):
     import greeks_evidence_registry as evidence
     import shadow_watch as watch
 
@@ -523,6 +655,12 @@ def build_market_research_report(capture_id, *, stream, legacy_archive, history_
     receipt = watch.parse_time(capture["receipt_tehran"])
     indexed = history_index(history_path)
     history = {code: indexed_history(indexed, code, receipt) for code in observed["by_underlying_id"]}
+    if csv_overlay is not None:
+        watch.require(not csv_overlays, "use either csv_overlay or csv_overlays, not both")
+        csv_overlays = (csv_overlay,)
+    overlay_technical, overlay_provenance = (
+        market_csv_overlays(indexed, csv_overlays, observed, capture, receipt) if csv_overlays else ({}, {})
+    )
     evaluated = capture["screening_status"] == "existing_replay"
     options, grouped = [], defaultdict(list)
     for ins_code, row in sorted(observed["contracts_by_id"].items()):
@@ -533,14 +671,15 @@ def build_market_research_report(capture_id, *, stream, legacy_archive, history_
 
     underlyings = {}
     for code, group in observed["by_underlying_id"].items():
-        technical = history[code]
+        # The temporary CSV supplies underlying indicators, not contract research evidence.
+        technical = overlay_technical.get(code, history[code])
         underlyings[code] = {"symbols": group["symbols"], **market_counts(grouped[code], evaluated),
                              "technical_analysis": technical | {
                                  "status": "AVAILABLE" if technical["status"] == "RESEARCH_ONLY" else "NOT_AVAILABLE",
                              }}
     counts = market_counts(options, evaluated)
     registry = evidence.current_assessment()
-    return {
+    report = {
         "schema_version": 2, "research_only": True, "execution_eligible": False, "point_in_time_verified": False,
         "capture_date_cutoff_exclusive": receipt.date().isoformat(), "capture": capture,
         "summary": counts | {"underlying_count": len(underlyings), "contract_count": len(options),
@@ -552,12 +691,59 @@ def build_market_research_report(capture_id, *, stream, legacy_archive, history_
         "greeks_evidence": {key: registry[key] for key in ("registry_version", "sha256", "topics")},
         "risk": {"status": "UNKNOWN", "max_quantity": None}, "limitations_fa": list(RESEARCH_LIMITATIONS),
     }
+    if len(overlay_provenance) == 1:
+        report["history_overlay"] = next(iter(overlay_provenance.values()))
+    elif overlay_provenance:
+        report["history_overlays"] = overlay_provenance
+        report["history_coverage"] = {
+            "underlying_count": len(underlyings),
+            "stored_history_ids": sorted(history.keys() & indexed[2].keys()),
+            "stored_available_ids": sorted(code for code, item in history.items() if item["status"] == "RESEARCH_ONLY"),
+            "overlay_csv_ids": sorted(overlay_provenance),
+            "missing_ids": sorted(code for code, item in underlyings.items()
+                                  if item["technical_analysis"]["status"] == "NOT_AVAILABLE"),
+        }
+    if overlay_provenance:
+        report["limitations_fa"].append(
+            "CSV دستی فقط در حافظه و برای پژوهش همین ثبت است؛ هویت منتسب، زمان دریافت و تعدیل نامعلوم، "
+            "و دسترسی نقطه‌درزمان تأیید نشده‌اند. این خروجی سیگنال معامله نیست."
+        )
+    if any("close_filter" in entry for entry in overlay_provenance.values()):
+        report["limitations_fa"].append(
+            "شاخص‌های CSV فیلترشده فقط سناریوی حساسیت محافظه‌کارانه‌اند؛ تاریخچهٔ رسمی بازسازی نشده است."
+        )
+    return report
 
 
 def market_summary(report):
     summary, counts, capture = report["summary"], report["reconciliation"], report["capture"]
     types, states, screening = summary["option_counts"], summary["research_counts"], summary["screening"]
     passed_types = screening["candidate_passes_by_type"]
+    overlay = report.get("history_overlay")
+    overlay_lines = () if overlay is None else (
+        f"CSV دستی (شناسهٔ منتسب {overlay['ins_code']}): {overlay['valid_closes_before_cutoff']} جلسهٔ فعال "
+        f"پیش از برش انحصاری {overlay['session_date_cutoff_exclusive']} تهران.",
+        "فقط پژوهش (RESEARCH_ONLY)، نه سیگنال معامله؛ زمان دریافت و تعدیل نامعلوم، دسترسی تاریخی تأیید نشده.",
+    )
+    if "history_overlays" in report:
+        coverage = report["history_coverage"]
+        listed = lambda key: "، ".join(coverage[key]) or "—"
+        overlay_lines = (
+            f"پوشش {coverage['underlying_count']} پایه — شناسه‌های ذخیره‌شده: {listed('stored_history_ids')}؛ "
+            f"CSV: {listed('overlay_csv_ids')}؛ بدون تحلیل: {listed('missing_ids')}.",
+            *(f"CSV دستی {code} ({entry['csv']['source_format']}؛ SHA-256: {entry['csv']['body_sha256']}): "
+              f"{entry['valid_closes_before_cutoff']} جلسهٔ فعال پیش از {entry['session_date_cutoff_exclusive']} تهران."
+              for code, entry in sorted(report["history_overlays"].items())),
+            "فقط پژوهش (RESEARCH_ONLY)، نه سیگنال معامله؛ شناسه‌ها منتسب‌اند، زمان دریافت و تعدیل نامعلوم، "
+            "دسترسی تاریخی تأیید نشده.",
+        )
+    for entry in report.get("history_overlays", {overlay["ins_code"]: overlay} if overlay else {}).values():
+        if "close_filter" in entry:
+            count = entry["close_filter"]["flagged_before_cutoff_count"]
+            overlay_lines += (
+                f"CSV {entry['ins_code']} — سیاست {entry['close_policy']}؛ {count} ردیف پیش از برش حذف شد. "
+                "فقط سناریوی حساسیت محافظه‌کارانه، نه تاریخچهٔ رسمی بازسازی‌شده.",
+            )
     return "\n".join((
         f"پژوهش کل بازار — ثبت {capture['capture_id']}، دریافت HTTP تهران: {capture['receipt_tehran']}",
         f"ردیف خام: {counts['raw_paired_rows']}؛ سمت خالی: {counts['empty_sides']}؛ "
@@ -569,11 +755,13 @@ def market_summary(report):
          if screening["evaluated"] else f"غربال و رتبه‌بندی انجام نشد: {capture['screening_status']}"),
         "وضعیت پژوهشی: " + "، ".join(f"{status}: {states[status]}" for status in RESEARCH_STATES),
         "آرشیوی و غیرقابل اجرا؛ زمان مظنه و سقف تعداد نامعلوم، Greeks آزمایشی و تأییدنشده.",
+        *overlay_lines,
         "جزئیات ردیف‌ها: --format json",
     ))
 
 
 def research_main(argv):
+    import fetch_underlying_history as fetch
     import shadow_collector as collector
     import shadow_watch as watch
 
@@ -587,13 +775,24 @@ def research_main(argv):
     parser.add_argument("--stream", type=Path, default=collector.STREAM)
     parser.add_argument("--legacy-archive", type=Path, default=watch.DEFAULT_ARCHIVE)
     parser.add_argument("--history", type=Path, default=BASE / "data" / "underlying_history.json")
+    for flag, key in CSV_OVERLAY_FLAGS.items():
+        parser.add_argument(flag, dest="csv_fields", action=CSVOverlayField, type=Path if key == "source" else str,
+                            choices=fetch.CSV_CLOSE_POLICIES if key == "close_policy" else None,
+                            help="آغاز گروه CSV محلی؛ فقط در پژوهش کل بازار" if key == "source" else None)
     args = parser.parse_args(argv)
+    if args.csv_fields and not args.all_underlyings:
+        parser.error("هم‌پوشان CSV فقط با --all-underlyings مجاز است.")
+    try:
+        csv_overlays = csv_argument_groups(args.csv_fields)
+    except ValueError as error:
+        parser.error(str(error))
     if not args.all_underlyings and (args.capture != RESEARCH_CAPTURE or args.format is not None):
         parser.error("حالت تک‌پایه فقط ثبت manual:2 و خروجی JSON نسخهٔ ۱ را می‌پذیرد.")
     try:
         if args.all_underlyings:
             report = build_market_research_report(args.capture, stream=args.stream,
-                                                  legacy_archive=args.legacy_archive, history_path=args.history)
+                                                  legacy_archive=args.legacy_archive, history_path=args.history,
+                                                  **({"csv_overlays": csv_overlays} if csv_overlays else {}))
             output = (json.dumps(report, ensure_ascii=False, allow_nan=False, sort_keys=True)
                       if args.format == "json" else market_summary(report))
         else:
@@ -607,6 +806,7 @@ def research_main(argv):
 
 
 if __name__ == "__main__":
-    if "--research" in sys.argv[1:]:
+    # CSV-specific arguments must never fall through to the legacy writer.
+    if "--research" in sys.argv[1:] or any(arg.startswith("--history-c") for arg in sys.argv[1:]):
         raise SystemExit(research_main(sys.argv[1:]))
     main()

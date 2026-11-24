@@ -1,10 +1,11 @@
 """Phase 2 offline tests; fixtures are isolated from the market archive and ledger."""
 
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 from http.client import HTTPConnection
+from io import StringIO
 import os
 from pathlib import Path
 import re
@@ -594,3 +595,187 @@ class CombinedResearchHTTPTests(CombinedCacheFixture):
         self.assertNotIn("sensitive path", html)
         self.assertEqual(self.ids(html), [])
         self.assertIsNone(self.cache.report)
+
+
+def overlay_spec(path, code, digest, policy=None):
+    spec = dict(source=path, code=code, source_sha256=digest,
+                instrument_page_url=f"https://www.tsetmc.com/instInfo/{code}")
+    return spec if policy is None else spec | {"close_policy": policy}
+
+
+def overlay_args(*specs):
+    return [value for spec in specs for flag, key in research.combined.CSV_OVERLAY_FLAGS.items()
+            if key in spec for value in (flag, str(spec[key]))]
+
+
+class OverlayStartupTests(CombinedCacheFixture):
+    def test_default_is_lazy_but_explicit_startup_validates_before_server_or_store(self):
+        p = self.root / "source.csv"
+        spec = overlay_spec(p, "81000", "a" * 64)
+        with patch.object(dashboard, "ApprovalStore") as store, patch.object(dashboard, "DashboardServer") as server, \
+                patch.object(dashboard.os, "umask"), patch.object(research, "CombinedCache") as make_cache, \
+                redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+            cache = make_cache.return_value
+            server.return_value.__enter__.return_value.origin = "http://127.0.0.1:8765"
+            self.assertEqual(dashboard.main([]), 0)
+            make_cache.assert_called_once_with()
+            cache.get.assert_not_called()
+            self.assertNotIn("پژوهش صریح با CSV", stdout.getvalue())
+            store.reset_mock()
+            server.reset_mock()
+            cache.get.return_value = None
+            self.assertEqual(dashboard.main(overlay_args(spec)), 1)
+            self.assertIn("هیچ منبعی فعال نشد", stderr.getvalue())
+            store.assert_not_called()
+            server.assert_not_called()
+            cache.get.reset_mock()
+            cache.get.return_value = full_market_fixture()
+            self.assertEqual(dashboard.main(overlay_args(spec)), 0)
+            make_cache.assert_called_with(csv_overlays=(spec,))
+            cache.get.assert_called_once_with()
+            self.assertIs(server.call_args.kwargs["combined_cache"], cache)
+            self.assertIn("http://127.0.0.1:8765/research/combined", stdout.getvalue())
+
+    def test_incomplete_groups_and_invalid_policy_never_reach_startup(self):
+        single = overlay_args(overlay_spec(self.root / "source.csv", "81000", "a" * 64))
+        for args in (single[:2], single + single[:2], single + ["--history-csv-close-policy", "ignore"],
+                     ["--history-csv-close-policy", "strict"]):
+            with self.subTest(args=args), patch.object(research, "CombinedCache") as cache, \
+                    patch.object(dashboard, "ApprovalStore") as store, \
+                    redirect_stderr(StringIO()), self.assertRaises(SystemExit) as err:
+                dashboard.main(args)
+            self.assertEqual(err.exception.code, 2)
+            cache.assert_not_called()
+            store.assert_not_called()
+
+
+class OverlayCacheTests(CombinedCacheFixture):
+    def test_per_mode_fingerprints_and_no_stale_or_partial_report(self):
+        p = self.root / "operator-input.csv"
+        raw = b"one CSV"
+        p.write_bytes(raw)
+        spec = overlay_spec(p, "81000", watch.digest(raw))
+        opted = research.CombinedCache(self.stream, self.history, csv_overlays=(spec,))
+        other = research.CombinedCache(self.stream, self.history, csv_overlays=(spec | {"close_policy": "strict"},))
+        self.assertNotEqual(opted.signature(), self.cache.signature())
+        self.assertNotEqual(opted.signature(), other.signature())
+
+        def build(*args, **kwargs):
+            result = full_market_fixture()
+            if kwargs.get("csv_overlays"):
+                result["history_overlay"] = {"ins_code": spec["code"], "status": "RESEARCH_ONLY",
+                    "execution_eligible": False, "point_in_time_verified": False, "csv": {
+                        "source_format": "tsetmc_manual_csv", "instrument_page_url": spec["instrument_page_url"],
+                        "body_sha256": spec["source_sha256"],
+                    }}
+            return result
+
+        with patch.object(research.combined, "build_market_research_report", side_effect=build) as called:
+            default = self.cache.get()
+            first = opted.get()
+            self.assertIsNotNone(first)
+            self.assertIsNot(first, default)
+            self.assertIs(opted.get(), first)
+            self.assertIs(self.cache.get(), default)
+            self.assertEqual(called.call_count, 2)
+            mtime = p.stat()
+            p.write_bytes(b"bad CSV")
+            os.utime(p, ns=(mtime.st_atime_ns, mtime.st_mtime_ns))
+            self.assertIsNone(opted.get())
+            self.assertIsNone(opted.report)
+            self.assertIs(self.cache.get(), default)
+            self.assertEqual(called.call_count, 2)
+            p.write_bytes(raw)
+            self.assertIsNot(opted.get(), first)
+            self.assertEqual(called.call_count, 3)
+            self.body.write_text("invalidated", encoding="utf-8")
+            called.side_effect = lambda *a, **kw: default  # Unexpected stored-only result from a replay.
+            self.assertIsNone(opted.get())
+            self.assertIsNone(opted.report)
+            bad = research.CombinedCache(self.stream, self.history, csv_overlays=(spec | {"source_sha256": "b" * 64},))
+            self.assertIsNone(bad.get())
+
+
+class RealCSVOverlayHTTPTests(unittest.TestCase):
+    def test_existing_local_csvs_if_present_on_research_route(self):
+        a = overlay_spec(watch.ROOT / "data/ahram_tsetmc_20261124_0b7c2113.csv", "17914401175772326",
+                         "0b7c2113370d2bebf7ef9d93e88ae333f526278ab3b6e04cf3ecc9e222bce0d5")
+        s = overlay_spec(watch.ROOT / "data/shasta_tsetmc_20261124_ed1280c0.csv", "2400322364771558",
+                         "ed1280c064b2e959e4eb9f72ccb6653b6469ba3f56e87ffa3a43aff4271b46f4",
+                         "exclude-close-outside-traded-range")
+        if not all(path.is_file() for path in (a["source"], s["source"],
+                   watch.ROOT / "data/underlying_history.json", collector.STREAM / "00000002/receipt.json")):
+            return  # These ignored operator inputs are not required in a new checkout.
+        store = Mock()
+        store.recent.return_value = []
+        store.current_fingerprints.return_value = {}
+        strict = research.CombinedCache(csv_overlays=(a, s | {"close_policy": "strict"}))
+        self.assertIsNone(strict.get())
+        base = research.CombinedCache().get()
+        cache = research.CombinedCache(csv_overlays=(a, s))
+        with patch("sqlite3.connect", side_effect=AssertionError("unexpected database access")), \
+                patch("urllib.request.urlopen", side_effect=AssertionError("unexpected network")), \
+                patch.object(collector, "fetch", side_effect=AssertionError("unexpected collection")), \
+                patch("paper_trading.PaperTrading.buy", side_effect=AssertionError("unexpected order")), \
+                patch.object(research.combined, "build_market_research_report",
+                             wraps=research.combined.build_market_research_report) as build, \
+                dashboard.DashboardServer(0, store, [], combined_cache=cache) as server:
+            thread = Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+            thread.start()
+            try:
+                def get(path, **headers):
+                    with closing(HTTPConnection(*server.server_address, timeout=10)) as connection:
+                        connection.request("GET", path, headers=headers)
+                        with connection.getresponse() as response:
+                            return response.status, dict(response.getheaders()), response.read().decode()
+
+                uri = dashboard.COMBINED_RESEARCH
+                self.assertEqual(get("/")[0], 200)
+                for query in ("history-csv=/tmp/path", "source_url=https://unknown.invalid", "capture=manual:3"):
+                    self.assertEqual(get(uri + "?" + query)[0], 400)
+                self.assertEqual(get(uri, Origin="https://unknown.invalid")[0], 403)
+                self.assertEqual(get(uri, Host="localhost")[0], 403)
+                build.assert_not_called()
+                store.reset_mock()
+                status, headers, options = get(uri)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+                self.assertEqual(options.count('class="candidate-card combined-option"'), research.PAGE_SIZE)
+                for text in ("پایه با تاریخچهٔ ذخیره‌شده<strong>", "پایه با CSV پژوهشی<strong>", "پایه بدون تحلیل فنی<strong>",
+                             "۱٬۲۷۶", "۶۳۸", "۱٬۲۳۳", "۳۵", "۴۳"):
+                    self.assertIn(text, options)
+                bases = get(uri + "?view=underlyings")[2]
+                self.assertEqual(bases.count('class="candidate-card combined-underlying"'), 18)
+                self.assertEqual(bases.count("NOT_AVAILABLE"), 15)
+                for text in (a["source_sha256"], s["source_sha256"], a["instrument_page_url"], s["instrument_page_url"],
+                             "سناریوی حساسیت محافظه‌کارانه", "نه بازسازی قیمت رسمی", "نقطه‌درزمان", "UNKNOWN",
+                             "۱٬۱۱۱", "۱٬۳۶۲", "۲۰۳", "۶۸", "۲۲", "2026-11-22"):
+                    self.assertIn(text, bases)
+                for spec, values in ((a, ("۹۰٬۳۲۴٫۶", "۵۴٫۳۳۷۴۳", "۵٬۱۳۶٫۳۷۳۹۶۴")),
+                                     (s, ("۳٬۶۴۰", "۴۸٫۴۹۳۱۰۷", "۳۰٫۵۱۲۶۱۱"))):
+                    code = spec["code"]
+                    option = next(r for r in base["options"] if r["underlying_code"] == code)
+                    result = get(uri + "?q=" + option["ins_code"])[2]
+                    for value in (*values, f"#underlying-{code}", "MACD(12,26,9)", "HV(20)"):
+                        self.assertIn(value, result)
+                    self.assertIn('id="underlying-' + code + '"', bases)
+                    self.assertNotIn(spec["source"].name, options + bases + result)
+                    self.assertNotIn(spec["source_sha256"], result)
+                self.assertNotIn("source_fields", bases)
+                self.assertNotIn("2020-04-18", bases)
+                self.assertNotIn("BUY_READY", options + bases)
+                self.assertNotIn('method="post"', options + bases)
+                self.assertEqual(get(uri + "?page=64")[2].count('class="candidate-card combined-option"'), 16)
+                self.assertEqual(cache.report["options"], base["options"])
+                self.assertEqual(cache.report["summary"]["research_counts"],
+                                 {"REJECTED": 1233, "UNKNOWN": 35, "RESEARCH_ONLY": 8})
+                self.assertEqual(cache.report["summary"]["screening"], base["summary"]["screening"])
+                self.assertEqual(cache.report["risk"], base["risk"])
+                self.assertFalse(cache.report["execution_eligible"])
+                self.assertEqual(cache.report["summary"]["technical_available_count"], 3)
+                build.assert_called_once()
+                self.assertEqual(store.mock_calls, [])
+            finally:
+                server.shutdown()
+                thread.join()

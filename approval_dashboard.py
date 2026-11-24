@@ -406,7 +406,7 @@ def combined_value(value, *, suffix=""):
     return ltr("UNKNOWN") if value is None else shown(value, suffix=suffix)
 
 
-def combined_option_card(row):
+def combined_option_card(row, *, technical_context=""):
     screen = row.get("screening") or {}
     rejection, rank_rejection = screen.get("candidate_rejection"), screen.get("rank_rejection")
     screened = research.combined_screening(row)
@@ -449,10 +449,66 @@ def combined_option_card(row):
             f'<p><strong>{h(research.COMBINED_STATUSES.get(status, "نامعلوم"))}</strong> · {ltr(status)} — '
             f'{h(row["reason_fa"])} {raw(row["reason_code"])}</p>{quotes}'
             f'<p>غربال اولیه: {h(screening)}<br>رتبه‌بندی سخت‌گیرانه: {h(rank)}</p>'
-            f'<details><summary>جزئیات فنی مشاهده</summary><div class="record-details">{details}</div></details></article>')
+            f'<details><summary>جزئیات فنی مشاهده</summary><div class="record-details">{details}</div></details>'
+            f'{technical_context}</article>')
 
 
-def combined_underlying_card(code, group):
+def combined_source_label(overlay):
+    if not overlay:
+        return "تاریخچهٔ ذخیره‌شده"
+    if "close_filter" in overlay:
+        return "CSV دستی TSETMC — سناریوی حساسیت محافظه‌کارانه"
+    return "CSV دستی TSETMC — سخت‌گیرانه"
+
+
+def option_technical_context(code, group, overlay, page_number):
+    tech = group["technical_analysis"]
+    if tech["status"] != "AVAILABLE" or not tech.get("history"):
+        return f'<p>تحلیل فنی پایه: {ltr("NOT_AVAILABLE")}</p>'
+    indicators = tech["history"]["indicators"]
+    names = ("SMA(5)", "SMA(20)", "RSI(14)_WILDER", "MACD(12,26,9)", "HV(20)_ANNUALIZED_PCT_SQRT252")
+    values = []
+    for name in names:
+        value = indicators.get(name, {}).get("value")
+        if isinstance(value, dict):
+            display = " / ".join(f"{raw(k)}: {combined_value(value.get(k))}" for k in ("line", "signal", "histogram"))
+        else:
+            display = combined_value(value)
+        values.append((name, display))
+    url = h(f"{COMBINED_RESEARCH}?view=underlyings&page={page_number}#underlying-{code}")
+    return (f'<details><summary>تحلیل فنی پایه — {h(combined_source_label(overlay))}</summary>'
+            f'<p>{h("، ".join(group["symbols"]))} {raw(code)} · فقط پژوهش</p>{fields(values)}'
+            f'<p><a href="{url}">منشأ و کیفیت تاریخچهٔ این پایه</a></p></details>')
+
+
+def combined_source_details(technical, history, overlay):
+    zero_count = len(history.get("zero_volume_excluded", ()))
+    if not overlay:
+        return '<details><summary>منشأ و کیفیت تاریخچهٔ ذخیره‌شده</summary>' + fields([
+            ("منبع", h(combined_source_label(None))),
+            ("SHA-256 تاریخچهٔ ذخیره‌شده", raw(technical.get("history_sha256"))),
+            ("رکوردهای حجم‌صفرِ حذف‌شده پیش از برش", shown(zero_count)),
+            ("دسترسی نقطه‌درزمان", ltr("UNVERIFIED")),
+        ]) + "</details>"
+    csv = overlay["csv"]
+    close_filter = overlay.get("close_filter", {})
+    anomaly_count = close_filter.get("flagged_before_cutoff_count", 0)
+    note = ("<p>حذف محافظه‌کارانهٔ پایانی خارج از بازهٔ معامله؛ سناریوی حساسیت، "
+            "نه بازسازی قیمت رسمی.</p>" if close_filter else "")
+    return f'<details><summary>منشأ و کیفیت — {h(combined_source_label(overlay))}</summary>' + fields([
+        ("قالب منبع", raw(csv["source_format"])),
+        ("صفحهٔ اصلی ابزار (نه URL دانلود)", raw(csv["instrument_page_url"])),
+        ("SHA-256 فایل خام", raw(csv["body_sha256"])),
+        ("هویت CSV", h("شناسه منتسب به اپراتور با قرینهٔ آرشیوی؛ نه هویت مستقلِ احراز‌شده")),
+        ("تعدیل / زمان دقیق دریافت / URL دانلود", " / ".join(ltr("UNKNOWN") for _ in range(3))),
+        ("دسترسی نقطه‌درزمان", ltr("UNVERIFIED")),
+        ("سیاست CSV", raw(overlay.get("close_policy", "strict"))),
+        ("رکوردهای حجم‌صفرِ حذف‌شده پیش از برش", shown(zero_count)),
+        ("جلسات با پایانی خارج از بازه، حذف‌شده پیش از برش", shown(anomaly_count)),
+    ]) + note + "</details>"
+
+
+def combined_underlying_card(code, group, *, overlay_mode=False, overlay=None):
     technical = group["technical_analysis"]
     content = f'<p>{ltr(technical["status"])} — {h(technical["reason_fa"])} {raw(technical["reason_code"])}</p>'
     if technical["status"] == "AVAILABLE" and technical.get("history"):
@@ -473,8 +529,11 @@ def combined_underlying_card(code, group):
             ("تعدیل / کامل‌بودن جلسات", f'{raw(history["adjustment_status"])} / {raw(history["session_completeness"])}'),
         ]) + ("<p>تاریخچه پس از ثبت اختیار دریافت شده است.</p>" if technical.get("downloaded_after_capture") else "")
         content += '<details><summary>مشاهدات فنی — نه سیگنال</summary>' + fields(indicators) + "</details>"
+        if overlay_mode:
+            content += combined_source_details(technical, history, overlay)
     types = group["option_counts"]
-    return (f'<article class="candidate-card combined-underlying"><h3>{shown("، ".join(group["symbols"]))} {raw(code)}</h3>'
+    anchor = f' id="underlying-{h(code)}"' if overlay_mode else ""
+    return (f'<article class="candidate-card combined-underlying"{anchor}><h3>{shown("، ".join(group["symbols"]))} {raw(code)}</h3>'
             f'<p>CALL: {shown(types["CALL"])} · PUT: {shown(types["PUT"])}</p>{content}</article>')
 
 
@@ -509,7 +568,18 @@ def combined_page(report, query):
                   *receipt_details(capture), ("ردهٔ داده", raw(capture["dataset_class"])),
                   ("نشانی منبع", raw(capture["source_url"])), ("وضعیت غربال ثبت", raw(capture["screening_status"])),
                   ("هش مهر", raw(capture["seal_sha256"])),
-              ]) + "<ul>" + "".join(f"<li>{h(note)}</li>" for note in report["limitations_fa"]) + "</ul></details>")
+               ]) + "<ul>" + "".join(f"<li>{h(note)}</li>" for note in report["limitations_fa"]) + "</ul></details>")
+    overlays = research.report_overlays(report)
+    if overlays:
+        available = {code for code, group in report["underlyings"].items()
+                     if group["technical_analysis"]["status"] == "AVAILABLE"}
+        header += ('<section><h2>پژوهش با CSV محلیِ انتخاب‌شده در شروع سرور</h2>'
+                   '<p>فقط زمینهٔ فنی برای اختیار؛ وضعیت قراردادها مستقل است. '
+                   'شناسه‌ها منتسب‌اند؛ تعدیل، زمان دریافت، URL خروجی و دسترسی تاریخی تأیید نشده‌اند.</p>'
+                   + card_grid([("پایه با تاریخچهٔ ذخیره‌شده", len(available - overlays.keys())),
+                                ("پایه با CSV پژوهشی", len(available & overlays.keys())),
+                                ("پایه بدون تحلیل فنی", len(report["underlyings"]) - len(available))])
+                   + "</section>")
 
     def link(**changes):
         return h(COMBINED_RESEARCH + "?" + urlencode(vars(query) | changes))
@@ -529,9 +599,18 @@ def combined_page(report, query):
                 ("نقدشوندگی ثبت‌شده", select_input("liquidity", {"": "همه", **research.COMBINED_LIQUIDITY}, query.liquidity)),
                 ("سررسید دقیق (میلادی)", f'<input name="expiry" type="date" value="{h(query.expiry)}">'),
             )) + f'<div class="filter-actions"><button type="submit">اعمال فیلتر</button> <a href="{COMBINED_RESEARCH}">پاک‌کردن</a></div></form>'
-        cards = "".join(combined_option_card(row) for row in rows)
+        contexts = {}
+        if overlays:
+            pages_by_code = {code: i // research.PAGE_SIZE + 1
+                             for i, code in enumerate(sorted(report["underlyings"]))}
+            contexts = {code: option_technical_context(code, report["underlyings"][code], overlays.get(code),
+                                                       pages_by_code[code])
+                        for code in {row["underlying_code"] for row in rows}}
+        cards = "".join(combined_option_card(row, technical_context=contexts.get(row["underlying_code"], ""))
+                        for row in rows)
     elif query.view == "underlyings":
-        cards = "".join(combined_underlying_card(code, group) for code, group in rows)
+        cards = "".join(combined_underlying_card(code, group, overlay_mode=bool(overlays),
+                                                 overlay=overlays.get(code)) for code, group in rows)
     else:
         cards = "".join(combined_diagnostic_card(row) for row in rows)
     pager = '<nav class="pager" aria-label="صفحه‌بندی">' + "".join(
@@ -1245,17 +1324,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="داشبورد آفلاین تأیید پژوهشی TSE/IFB")
     parser.add_argument("--port", type=int, default=8765)
+    research.add_csv_overlay_args(parser)
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
+    try:
+        overlays = research.combined.csv_argument_groups(args.csv_fields)
+    except ValueError as error:
+        parser.error(str(error))
     os.umask(0o077)
     try:
+        combined_cache = None
+        if overlays:
+            combined_cache = research.CombinedCache(csv_overlays=overlays)
+            if combined_cache.get() is None:
+                raise ValueError("اعتبارسنجی هم‌پوشان CSV پژوهشی ناموفق بود؛ هیچ منبعی فعال نشد.")
         store = ApprovalStore(DB, phase1_eligible)
         store.initialize()
         store.reconcile()
         with DashboardServer(args.port, store, [], cache=research.ArchiveCache(),
-                             combined_cache=research.CombinedCache()) as server:
+                             combined_cache=combined_cache if overlays else research.CombinedCache()) as server:
             print(f"داشبورد پژوهشی: {server.origin}/", flush=True)
+            if overlays:
+                print(f"پژوهش صریح با CSV: {server.origin}{COMBINED_RESEARCH}", flush=True)
             server.serve_forever()
     except KeyboardInterrupt:
         return 0

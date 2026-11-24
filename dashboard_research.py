@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from itertools import islice
 import math
+from pathlib import Path
 import re
 import stat
 import subprocess
@@ -14,6 +15,7 @@ from urllib.parse import parse_qs
 from zoneinfo import ZoneInfoNotFoundError
 
 import combine_analysis as combined
+import fetch_underlying_history as fetch
 import greeks_evidence_registry as evidence
 import shadow_collector as collector
 import shadow_multiday
@@ -266,6 +268,23 @@ def manual_file_stamps(stream):
                 yield child.name, stamp(child, stat.S_ISREG)
 
 
+def add_csv_overlay_args(parser):
+    for flag, key in combined.CSV_OVERLAY_FLAGS.items():
+        parser.add_argument(flag, dest="csv_fields", action=combined.CSVOverlayField,
+                            type=Path if key == "source" else str,
+                            choices=fetch.CSV_CLOSE_POLICIES if key == "close_policy" else None,
+                            help="منبع CSV فقط برای پژوهش کل بازار در شروع سرور" if key == "source" else None)
+
+
+def report_overlays(report):
+    if "history_overlays" in report:
+        return report["history_overlays"]
+    if entry := report.get("history_overlay"):
+        watch.require(isinstance(entry, dict), "unexpected combined CSV provenance")
+        return {entry.get("ins_code"): entry}
+    return {}
+
+
 class ArchiveCache:
     """Stat the bounded archive on GET; replay only on a changed generation."""
 
@@ -313,10 +332,13 @@ class ArchiveCache:
 
 
 class CombinedCache:
-    """One in-memory version-2 report for the fixed capture; loaded on explicit GET only."""
+    """One in-memory report per server; default mode is lazy and CSV mode is startup-pinned."""
 
-    def __init__(self, stream=collector.STREAM, history_path=watch.ROOT / "data/underlying_history.json"):
+    def __init__(self, stream=collector.STREAM, history_path=watch.ROOT / "data/underlying_history.json", *,
+                 csv_overlays=()):
         self.stream, self.history_path = stream, history_path
+        self._overlay_specs = tuple(sorted((tuple(sorted(spec.items())) for spec in csv_overlays),
+                                           key=lambda spec: dict(spec)["code"]))
         self.key = self.report = None
         try:
             self.code_key = self.code_signature()
@@ -324,14 +346,54 @@ class CombinedCache:
             self.code_key = None
 
     def code_signature(self):
-        return tuple(stamp(watch.ROOT / name, stat.S_ISREG) for name in COMBINED_CODE_FILES)
+        files = COMBINED_CODE_FILES + (("fetch_underlying_history.py",) if self._overlay_specs else ())
+        return tuple(stamp(watch.ROOT / name, stat.S_ISREG) for name in files)
+
+    def csv_signature(self):
+        fingerprints, size = [], 0
+        for spec in self._overlay_specs:
+            config = dict(spec)
+            expected = config["source_sha256"]
+            watch.require(fetch.is_sha256(expected), "invalid CSV SHA-256")
+            with fetch.pinned_path(config["source"]) as source:
+                raw, version = source.read(fetch.MAX_CSV_BYTES)
+            size += len(raw)
+            watch.require(size <= watch.MAX_BODY, "combined CSV inputs exceed size limit")
+            actual = watch.digest(raw)
+            watch.require(actual == expected, "CSV SHA-256 mismatch")
+            fingerprints.append((spec, actual, version))
+        return tuple(fingerprints)
 
     def signature(self):
         # Imported Python modules cannot be safely hot-reloaded with the replay scripts.
         watch.require(self.code_key is not None and self.code_key == self.code_signature(),
                       "restart required after research code change")
-        return (stamp(self.stream, stat.S_ISDIR), *manual_file_stamps(self.stream),
-                stamp(self.history_path, stat.S_ISREG, optional=True), stamp(evidence.REGISTRY, stat.S_ISREG))
+        return (COMBINED_CAPTURE, self.csv_signature(), stamp(self.stream, stat.S_ISDIR),
+                *manual_file_stamps(self.stream), stamp(self.history_path, stat.S_ISREG, optional=True),
+                stamp(evidence.REGISTRY, stat.S_ISREG))
+
+    def validate_overlays(self, report):
+        overlays = report_overlays(report)
+        specs = [dict(spec) for spec in self._overlay_specs]
+        watch.require(isinstance(overlays, dict) and overlays.keys() == {spec["code"] for spec in specs},
+                      "unexpected combined CSV provenance")
+        for spec in specs:
+            code = spec["code"]
+            entry = overlays[code]
+            csv = entry.get("csv") if isinstance(entry, dict) else None
+            watch.require(isinstance(csv, dict) and code in report["underlyings"] and entry.get("ins_code") == code
+                          and entry.get("status") == "RESEARCH_ONLY"
+                          and entry.get("point_in_time_verified") is False
+                          and entry.get("execution_eligible") is False
+                          and csv.get("body_sha256") == spec["source_sha256"]
+                          and csv.get("instrument_page_url") == spec["instrument_page_url"]
+                          and csv.get("source_format") == "tsetmc_manual_csv"
+                          and entry.get("close_policy", "strict") == spec.get("close_policy", "strict"),
+                          "unexpected combined CSV provenance")
+        if specs:
+            watch.require(all(isinstance(row, dict) and row.get("execution_eligible") is False
+                              for row in report["options"]),
+                          "unexpected executable research row")
 
     def get(self):
         try:
@@ -341,6 +403,7 @@ class CombinedCache:
             self.key = self.report = None
             report = combined.build_market_research_report(
                 COMBINED_CAPTURE, stream=self.stream, legacy_archive=watch.DEFAULT_ARCHIVE, history_path=self.history_path,
+                **({"csv_overlays": tuple(dict(spec) for spec in self._overlay_specs)} if self._overlay_specs else {}),
             )
             watch.require(isinstance(report, dict) and report.get("schema_version") == 2
                           and all(isinstance(report.get(key), dict)
@@ -353,6 +416,7 @@ class CombinedCache:
                           and report.get("greeks_assumption_status") == "experimental_unverified"
                           and report.get("risk") == {"status": "UNKNOWN", "max_quantity": None},
                           "unexpected combined research report")
+            self.validate_overlays(report)
             watch.require(key == self.signature(), "combined research inputs changed during replay")
         except COMBINED_ERRORS:
             self.key = self.report = None

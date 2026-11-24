@@ -1,6 +1,7 @@
 """Offline tests with in-memory daily history, never saved as market data."""
 
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from email.message import Message
 from io import BytesIO, StringIO
@@ -17,6 +18,26 @@ from urllib.error import HTTPError
 
 import analyze_underlying_trends_v2 as trends
 import fetch_underlying_history as fetch
+
+
+CSV_HEADER = (
+    b"<TICKER>,<DTYYYYMMDD>,<FIRST>,<HIGH>,<LOW>,<CLOSE>,<VALUE>,<VOL>,<OPENINT>,<PER>,<OPEN>,<LAST>\r\n"
+)
+AHRAM_SHA256 = "0b7c2113370d2bebf7ef9d93e88ae333f526278ab3b6e04cf3ecc9e222bce0d5"
+
+
+def csv_row(day, *, zero=False, unusual=False):
+    if zero:
+        fields = (" 11690.00" if unusual else " 0.00", " 0.00", " 0.00",
+                  " 11310.00", "0.00", " 0", "0", "D", "11310.00", "11340.00")
+    else:
+        fields = (" 99.125", " 104.00", " 98.00", " 100.00", "1000.00", " 10", "2",
+                  "D", "115.00", "103.00")
+    return ",".join(("Sample ETF", day.strftime("%Y%m%d"), *fields)).encode() + b"\n"
+
+
+def csv_export(lines, *, blank=True):
+    return CSV_HEADER + (b"\n" if blank else b"") + b"".join(lines)
 
 
 class HistoricalResearchTests(unittest.TestCase):
@@ -704,6 +725,345 @@ class HistoryCollectorTests(unittest.TestCase):
             fetch.local_import(**inputs)
         self.assertEqual(backup.read_bytes(), b"keep")
         self.assertEqual(self.history.read_bytes(), self.baseline)
+
+    def csv_lines(self):
+        first = date(2025, 12, 20)
+        return [csv_row(first + timedelta(days=i), zero=i < 2, unusual=i == 1) for i in range(42)] + [
+            csv_row(date(2026, 2, n)) for n in (1, 2)
+        ]
+
+    def csv_import_input(self, raw=None, received_at=None, code="80002"):
+        if raw is None:
+            raw = csv_export(self.csv_lines())
+        return self.import_input(code, raw) | {
+            "source_url": f"https://www.tsetmc.com/instInfo/{code}",
+            "source_format": "tsetmc-csv", "received_at": received_at,
+        }
+
+    def csv_cli(self, inputs):
+        args = self.import_cli(inputs)
+        if inputs["received_at"] is None:
+            start = args.index("--received-at")
+            del args[start:start + 2]
+        return args + ["--source-format", "tsetmc-csv"]
+
+    def csv_entry(self, inputs):
+        capture, bases = fetch.capture_inventory(inputs["capture_id"], stream=self.stream)
+        return fetch.CSVObservation(
+            inputs["code"], tuple(bases[inputs["code"]]), inputs["source"].read_bytes(),
+            inputs["source_sha256"], inputs["source_url"], inputs["received_at"], capture,
+        )
+
+    def test_csv_hash_is_checked_before_decoding_or_dispatching_parser(self):
+        inputs = self.csv_import_input(raw=b"\xffwrong")
+        with patch.object(fetch, "validate_csv_history") as parser:
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                fetch.local_import(**(inputs | {"source_sha256": "0" * 64}))
+        parser.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            fetch.validate_csv_history(b"\xff", "0" * 64, inputs["code"], received_at=None)
+        self.assertEqual(self.history.read_bytes(), self.baseline)
+        self.assertFalse(inputs["backup"].exists())
+
+    def test_csv_columns_exact_cells_and_optional_blank_line(self):
+        for blank in (False, True):
+            with self.subTest(blank=blank):
+                inputs = self.csv_import_input(raw=csv_export(self.csv_lines(), blank=blank))
+                item = self.csv_entry(inputs).entry()
+                rows = item["history"]
+                self.assertEqual(len(rows), 44)
+                self.assertEqual([r["dEven"] for r in rows], sorted((r["dEven"] for r in rows), reverse=True))
+                self.assertEqual(item["provenance"]["ticker"], "Sample ETF")
+                self.assertEqual(
+                    tuple(rows[0][k] for k in ("priceFirst", "priceYesterday", "pClosing", "pDrCotVal")),
+                    (99.125, 115, 100, 103),
+                )
+                self.assertEqual(tuple(rows[0]["_source_fields"]), fetch.CSV_HEADER)
+                self.assertEqual(rows[0]["_source_fields"]["<FIRST>"], " 99.125")
+                self.assertEqual(rows[0]["_source_fields"]["<OPENINT>"], "2")
+                self.assertEqual(rows[0]["insCode"], "80002")
+                self.assertNotIn("insCode", rows[0]["_source_fields"])
+                self.assertEqual(rows[-2]["priceFirst"], 11690)
+                self.assertEqual(rows[-2]["priceMax"], 0)
+                self.assertFalse(rows[-2]["_quality"]["ohlc_valid"])
+                self.assertTrue(rows[-2]["_quality"]["zero_volume_unusual_prices"])
+                self.assertFalse(rows[-1]["_quality"]["volume_valid"])
+
+    def test_csv_strict_syntax_values_and_active_ohlc(self):
+        lines = self.csv_lines()
+        base = lines[-1]
+        cells = base.rstrip(b"\n").split(b",")
+        invalid_fields = (
+            (0, b"", "missing CSV field"), (0, b"Different", "ticker or period"),
+            (0, b"\xff", "utf-8"), (1, b"20260230", "YYYYMMDD"),
+            (1, b"2026-02-02", "YYYYMMDD"), (1, b"20260201", "duplicate"),
+            (2, b"105", "inconsistent active"), (2, b"99.1250000000000000001", "precision"),
+            (2, b"NaN", "invalid CSV number"), (2, b"Infinity", "invalid CSV number"),
+            (3, b"9007199254740993", "exact numeric range"), (3, b"97", "inconsistent active"),
+            (4, b"0", "inconsistent active"), (5, b"105", "inconsistent active"),
+            (5, b"0", "invalid CSV closing"), (7, b"True", "invalid CSV number"),
+            (7, b"-1", "invalid CSV number"), (7, b"0.1", "not an integer"),
+            (9, b"W", "ticker or period"), (11, b"97", "inconsistent active"),
+        )
+        for pos, value, reason in invalid_fields:
+            invalid = cells.copy()
+            invalid[pos] = value
+            raw = csv_export(lines[:-1] + [b",".join(invalid) + b"\n"])
+            with self.subTest(pos=pos, value=value), self.assertRaisesRegex(ValueError, reason):
+                self.csv_entry(self.csv_import_input(raw=raw)).entry()
+        for raw, reason in (
+            (csv_export(lines).replace(b"<FIRST>", b"<OPEN>", 1), "header"),
+            (csv_export(lines).replace(b"\r\n\n", b"\r\n\n\n", 1), "invalid CSV row"),
+            (csv_export(lines + [base.rstrip() + b",extra\n"]), "invalid CSV row"),
+            (csv_export(lines[:-1] + [b",".join(cells[:-1]) + b"\n"]), "invalid CSV row"),
+            (csv_export(lines + [b'"unterminated\n']), "CSV syntax"),
+            (csv_export(lines + [lines[0]]), "duplicate"),
+            (csv_export(lines[:22]), "fewer than 21"),
+            (b" " * (fetch.MAX_CSV_BYTES + 1), "size limit"),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                fetch.local_import(**self.csv_import_input(raw=raw))
+        received = "2026-02-01T20:00:00+00:00"  # Still Feb 1 in Tehran.
+        with self.assertRaisesRegex(ValueError, "future or duplicate"):
+            fetch.local_import(**self.csv_import_input(received_at=received))
+
+    def test_csv_dry_run_unknown_receipt_is_capture_bound_and_never_written(self):
+        inputs = self.csv_import_input()
+        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        real_open = os.open
+
+        def readonly_open(path, flags, *args, **kwargs):
+            self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(fetch.os, "open", side_effect=readonly_open), \
+                patch.object(fetch.os, "replace", side_effect=AssertionError("unexpected rename")), \
+                redirect_stdout(StringIO()) as out:
+            self.assertEqual(fetch.main(self.csv_cli(inputs)), 0)
+        report = json.loads(out.getvalue())
+        provenance = report["provenance"]
+        self.assertEqual(report["mode"], "dry-run")
+        self.assertIsNone(report["received_at"])
+        self.assertEqual(provenance["receipt_status"], "UNKNOWN")
+        self.assertEqual(provenance["capture_receipt_tehran"], "2026-02-01T11:30:00+03:30")
+        self.assertEqual(provenance["instrument_page_url"], inputs["source_url"])
+        self.assertIsNone(provenance["source_url"])
+        self.assertIsNone(provenance["http_status"])
+        self.assertFalse(provenance["ins_code_present_in_source"])
+        self.assertEqual(provenance["identity_verification"], "operator_attributed_with_archival_corroboration")
+        self.assertEqual(provenance["adjustment_status"], "UNKNOWN")
+        self.assertEqual(provenance["body_sha256"], inputs["source_sha256"])
+        self.assertIn("seal_sha256", provenance)
+        self.assertEqual(report["csv_validation"]["session_date_cutoff_exclusive"], "2026-02-01")
+        self.assertEqual(report["csv_validation"]["records_before_cutoff"], 42)
+        self.assertEqual(report["csv_validation"]["excluded_at_or_after_cutoff"], 2)
+        self.assertEqual(report["csv_validation"]["zero_volume_count"], 2)
+        self.assertEqual(report["csv_validation"]["zero_volume_unusual_price_dates"], [20251221])
+        coverage = report["capture_coverage"]
+        self.assertEqual((coverage["before_available"], coverage["after_available"]), (1, 2))
+        self.assertEqual((coverage["before_missing_ids"], coverage["after_missing_ids"]), (22, 21))
+        self.assertEqual(coverage["instrument_after"]["valid_closes_before_cutoff"], 40)
+        self.assertEqual(coverage["standard_research_reader"]["reason_code"], "history_evidence_incomplete")
+        self.assertTrue(coverage["preview_only_without_download_receipt"])
+        self.assertFalse(report["execution_eligible"])
+        self.assertFalse(report["point_in_time_verified"])
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}, before)
+        self.assertFalse(inputs["backup"].exists())
+        self.opener.assert_not_called()
+
+    def test_csv_identity_checks_and_receipt_policy(self):
+        inputs = self.csv_import_input()
+        for change, reason in (
+            ({"source_url": "https://www.tsetmc.com/instInfo/80003"}, "source URL or instrument ID"),
+            ({"capture_id": "manual:2"}, "absent from selected capture"),
+            ({"received_at": "UNKNOWN"}, "receipt timestamp"),
+            ({"received_at": "2026-02-02T00:00:00-00:00"}, "receipt timestamp"),
+            ({"received_at": "2026-02-02T01:00:00+00:00"}, "future"),
+            ({"source_format": "unknown"}, "source format"),
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, reason):
+                fetch.local_import(**(inputs | change))
+        capture, bases = fetch.capture_inventory("manual:1", stream=self.stream)
+        for info, inventory, reason in (
+            (capture | {"diagnostics": [{"excluded_from_options": True}]}, bases, "archive identity diagnostics"),
+            (capture, dict(bases) | {"80002": {"alias", "conflicting"}}, "ambiguous display name"),
+            (capture, dict(bases) | {"80003": {" صندوق نمونه 2 "}}, "ambiguous display name"),
+        ):
+            with self.subTest(reason=reason), patch.object(fetch, "capture_inventory", return_value=(info, inventory)), \
+                    self.assertRaisesRegex(ValueError, reason):
+                fetch.local_import(**inputs)
+        with self.assertRaisesRegex(ValueError, "existing or duplicate"):
+            fetch.local_import(**self.csv_import_input(code=self.code))
+
+    def test_csv_merge_preserves_literal_khodro_and_no_apply_bypass(self):
+        inputs = self.csv_import_input()
+        observation = self.csv_entry(inputs)
+        literal = json.dumps(self.old_entry, ensure_ascii=True).replace('"pClosing": 100', '"pClosing": 1.000e2')
+        baseline = self.baseline.replace(json.dumps(self.old_entry, ensure_ascii=False).encode(), literal.encode())
+        self.assertNotEqual(baseline, self.baseline)
+        self.history.write_bytes(baseline)
+        plan = fetch.prepare_merge(baseline, [observation], preview_unknown_csv_code=inputs["code"])
+        self.assertIn(literal.encode(), plan.replacement)
+        self.assertEqual(plan.baseline, self.history.read_bytes())
+        document = json.loads(plan.replacement)
+        self.assertEqual(document["metadata"], json.loads(baseline)["metadata"] | {"symbol_count": 2})
+        with self.assertRaisesRegex(ValueError, "missing receipt"):
+            fetch.history_ids(document)  # Not a normal consumable/publishable history.
+        with patch.object(fetch.os, "open", side_effect=AssertionError("unexpected file access")), \
+                redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err:
+            self.assertEqual(fetch.main(self.csv_cli(inputs) + ["--apply"]), 2)
+            self.assertIn("publication disabled", err.getvalue())
+            self.assertFalse(out.getvalue())
+            with self.assertRaisesRegex(ValueError, "publication disabled"):
+                fetch.local_import(**inputs, apply=True, expected_history_sha256=fetch.watch.digest(baseline))
+        self.assertEqual(self.history.read_bytes(), baseline)
+        self.assertFalse(inputs["backup"].exists())
+
+    def test_csv_full_market_exact_id_join_with_known_receipt_and_gates(self):
+        inputs = self.csv_import_input(received_at=self.received.isoformat())
+        imported = fetch.local_import(**inputs)
+        self.assertFalse(imported["capture_coverage"]["preview_only_without_download_receipt"])
+        self.assertEqual(imported["provenance"]["receipt_status"], "OPERATOR_SUPPLIED")
+        observation = self.csv_entry(inputs)
+        plan = fetch.prepare_merge(self.baseline, [observation])
+        document = json.loads(plan.replacement)
+        # An unrelated base using the CSV display key must not get the history.
+        document["symbols"]["نام نمایشی دیگر"] = document["symbols"].pop(observation.key)
+        index = {entry["code"]: [(name, entry)] for name, entry in document["symbols"].items()}
+        sealed, _ = fetch.watch.read_object(self.stream / "00000001/body.raw.json", fetch.watch.MAX_BODY)
+        rows, *_ = fetch.quality.inventory_contracts(sealed["instrumentOptMarketWatch"])
+        # Exercise the real capture/ID join without running screening over the minimal fixture.
+        states = {code: row | {
+            "candidate_eligible": True, "candidate_rejection": None, "rank_eligible": False,
+            "rank_rejection": fetch.quality.NO_MODEL, "iv_status": "ok",
+            "greeks_assumption_status": "experimental_unverified",
+        } for code, row in rows.items()}
+        fake_index = (fetch.watch.digest(plan.replacement), document["metadata"], index, None)
+        with patch.object(fetch.watch, "contract_states", return_value=states), \
+                patch.object(fetch.combined, "history_index", return_value=fake_index), \
+                patch.object(fetch.combined, "atomic_write", side_effect=AssertionError("unexpected write")):
+            report = fetch.combined.build_market_research_report(
+                "manual:1", stream=self.stream, legacy_archive=self.root, history_path=self.history
+            )
+        tech = report["underlyings"][inputs["code"]]["technical_analysis"]
+        self.assertEqual((tech["status"], tech["symbol"]), ("AVAILABLE", "نام نمایشی دیگر"))
+        self.assertEqual(report["underlyings"]["80003"]["technical_analysis"]["reason_code"], "history_id_not_found")
+        self.assertEqual(tech["history"]["source"], "tsetmc_manual_csv")
+        self.assertEqual(tech["history"]["provenance"]["body_sha256"], inputs["source_sha256"])
+        self.assertEqual(tech["history"]["valid_close_count"], 40)
+        self.assertEqual(tech["history"]["indicators"]["SMA(5)"]["value"], 100)
+        self.assertTrue(tech["downloaded_after_capture"])
+        self.assertEqual(report["summary"]["technical_available_count"], 2)
+        self.assertEqual(report["summary"]["screening"]["strict_passes"], 0)
+        self.assertTrue(report["research_only"])
+        self.assertFalse(report["point_in_time_verified"])
+        self.assertFalse(report["execution_eligible"])
+        self.assertEqual(report["greeks_assumption_status"], "experimental_unverified")
+        self.assertNotIn("BUY_READY", json.dumps(report))
+        self.assertTrue(all(not row["execution_eligible"] for row in report["options"]))
+
+    def test_csv_ahram_cutoff_regression_and_pinned_real_export_if_present(self):
+        first = date(2021, 12, 20)
+        lines = [csv_row(first + timedelta(days=i), zero=1 <= i <= 67 or i == 215, unusual=i == 215)
+                 for i in range(1178)]
+        synthetic = csv_export([csv_row(date(2026, 11, n)) for n in (23, 22, 21)] + lines[::-1])
+        real = Path(__file__).with_name("data") / "ahram_tsetmc_20261124_0b7c2113.csv"
+        exports = [(synthetic, fetch.watch.digest(synthetic))]
+        if real.is_file():  # Ignored local source is not a dependency of the offline suite.
+            exports.append((real.read_bytes(), AHRAM_SHA256))
+        code = "17914401175772326"
+        before = date(2026, 11, 22)
+        for raw, sha in exports:
+            with self.subTest(sha=sha):
+                rows, _ = fetch.validate_csv_history(raw, sha, code, received_at=None)
+                self.assertEqual(len(rows), 1181)
+                self.assertEqual(sum(row["_quality"]["volume_valid"] for row in rows), 1113)
+                unusual = [row["dEven"] for row in rows if row["_quality"]["zero_volume_unusual_prices"]]
+                self.assertEqual(unusual, [20220723])
+                item = {"code": code, "history": rows, "fetched_at": None, "provenance": {
+                    "source_format": trends.CSV_SOURCE_FORMAT, "receipt_status": "UNKNOWN",
+                    "capture_receipt_tehran": "2026-11-22T09:49:47.189635+03:30",
+                }}
+                with self.assertRaisesRegex(ValueError, "زمان محلی دریافت"):
+                    trends.research_report("اهرم", item, {}, before=before)
+                report = trends.research_report("اهرم", item, {}, before=date(2026, 12, 1),
+                                                expected_code=code, preview_unknown_csv_receipt=True)
+                prefix = item | {"history": [row for row in rows if row["dEven"] < 20261122]}
+                prefix_report = trends.research_report("اهرم", prefix, {}, before=before,
+                                                       preview_unknown_csv_receipt=True)
+                self.assertEqual(report["session_date_cutoff_exclusive"], "2026-11-22")
+                self.assertEqual(report["records_before_cutoff"], 1179)
+                self.assertEqual(report["valid_close_count"], 1111)
+                self.assertEqual(report["excluded_at_or_after_cutoff"], 2)
+                self.assertEqual(len(report["zero_volume_excluded"]), 68)
+                self.assertEqual(report["valid_close_date_range"], ["2021-12-20", "2026-11-21"])
+                self.assertEqual(report["indicators"], prefix_report["indicators"])
+                self.assertIsNone(report["downloaded_at_utc"])
+                self.assertFalse(report["point_in_time_verified"])
+
+    def test_csv_close_policy_uses_unmodified_rows_and_keeps_zero_volume(self):
+        start = date(2026, 1, 1)
+        lines = [csv_row(start + timedelta(days=i)) for i in range(25)]
+        lines[0] = lines[0].replace(b" 100.00,", b" 110.25,", 1)
+        lines[1] = lines[1].replace(b" 100.00,", b" 95.125,", 1)
+        raw = csv_export(lines + [csv_row(date(2025, 12, 31), zero=True, unusual=True)])
+        inputs = self.csv_import_input(raw=raw)
+        default = self.csv_entry(inputs)
+        with self.assertRaisesRegex(ValueError, "inconsistent active CSV OHLC/last"):
+            default.entry()
+        mode = fetch.CSV_CLOSE_POLICIES[1]
+        entry = replace(default, close_policy=mode).entry()
+        audit = entry["close_filter"]
+        self.assertEqual(audit["flagged_row_count"], 2)
+        self.assertEqual((audit["close_above_high_count"], audit["close_below_low_count"]), (1, 1))
+        for record, line, day, reason in zip(audit["flagged_rows"][::-1], lines[:2], ("2026-01-01", "2026-01-02"),
+                                             ("close_above_traded_high", "close_below_traded_low"), strict=True):
+            self.assertEqual((record["session_date"], record["reason"]), (day, reason))
+            self.assertEqual(list(record["source_fields"].values()), line.decode().rstrip("\n").split(","))
+        self.assertEqual(entry["record_count"], 26)
+        self.assertEqual(entry["quality"]["active_session_count"], 25)
+        self.assertEqual(entry["quality"]["valid_ohlc_count"], 23)
+        self.assertEqual(entry["quality"]["zero_volume_count"], 1)
+        self.assertEqual({r["pClosing"] for r in entry["history"] if r["qTotTran5J"]}, {100})
+        self.assertNotIn(20260101, {r["dEven"] for r in entry["history"]})
+        self.assertNotIn(20260102, {r["dEven"] for r in entry["history"]})
+        self.assertEqual(entry["history"][-1]["qTotTran5J"], 0)
+        self.assertEqual(entry["history"][-1]["priceFirst"], 11690)
+        self.assertEqual(inputs["source"].read_bytes(), raw)
+
+    def test_csv_close_policy_does_not_relax_hash_ohlc_or_minimum(self):
+        mode = fetch.CSV_CLOSE_POLICIES[1]
+        base = [csv_row(date(2026, 1, 1) + timedelta(days=i)) for i in range(21)]
+        for original, replacement, reason in (
+            (b" 99.125,", b" 97.99,", "inconsistent active CSV OHLC/last"),
+            (b",103.00\n", b",104.01\n", "inconsistent active CSV OHLC/last"),
+            (b" 104.00,", b" 97.00,", "inconsistent active CSV OHLC/last"),
+            (b" 100.00,", b" 110.00,", "fewer than 21 active sessions"),
+            (b" 100.00,", b" 110.0000000000000001,", "decimal precision"),
+        ):
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(ValueError, reason):
+                raw = csv_export([base[0].replace(original, replacement, 1), *base[1:]])
+                fetch.validate_csv_history(raw, fetch.watch.digest(raw), "80002", received_at=None, close_policy=mode)
+        with patch.object(fetch.csv, "reader", side_effect=AssertionError("parsed before verified hash")), \
+                self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            fetch.validate_csv_history(b"\xffinvalid", "0" * 64, "80002", received_at=None, close_policy=mode)
+
+    def test_pinned_shasta_source_conservative_counts_when_available(self):
+        source = Path(__file__).with_name("data") / "shasta_tsetmc_20261124_ed1280c0.csv"
+        if source.is_file():
+            raw = source.read_bytes()
+            sha = "ed1280c064b2e959e4eb9f72ccb6653b6469ba3f56e87ffa3a43aff4271b46f4"
+            code = "2400322364771558"
+            with self.assertRaisesRegex(ValueError, "inconsistent active CSV OHLC/last"):
+                fetch.validate_csv_history(raw, sha, code, received_at=None)
+            rows, _ = fetch.validate_csv_history(raw, sha, code, received_at=None,
+                                                 close_policy=fetch.CSV_CLOSE_POLICIES[1])
+            active = [r for r in rows if r["qTotTran5J"]]
+            pre = [r for r in active if r["dEven"] < 20261122]
+            flags = [r["_quality"]["close_anomaly"] for r in pre if "close_anomaly" in r["_quality"]]
+            self.assertEqual((len(rows), len(active), len(pre)), (1589, 1386, 1384))
+            self.assertEqual((flags.count("close_above_traded_high"), flags.count("close_below_traded_low")), (5, 17))
+            self.assertEqual(sum(r["_quality"]["ohlc_valid"] for r in pre), 1362)
 
 if __name__ == "__main__":
     unittest.main()

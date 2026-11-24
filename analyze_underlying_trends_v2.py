@@ -16,6 +16,7 @@ MAX_DATA_AGE_HOURS = 36
 MIN_ACTIVE_SESSIONS = 21
 ANNUALIZATION_SESSIONS = 252  # Illustrative convention; not an estimate of the TSE calendar.
 MACD_WARMUP = 60  # Diagnostic only; first full MACD value is defined at 34 closes.
+CSV_SOURCE_FORMAT = "tsetmc_manual_csv"
 
 
 def now():
@@ -369,7 +370,19 @@ def observed_indicators(rows):
     return indicators
 
 
-def research_report(name, item, metadata, *, before, calendar=None, expected_code=None):
+def csv_provenance(item):
+    provenance = item.get("provenance")
+    return provenance if isinstance(provenance, dict) and provenance.get("source_format") == CSV_SOURCE_FORMAT else None
+
+
+def unknown_csv_receipt(item):
+    provenance = csv_provenance(item)
+    return (provenance is not None and "fetched_at" in item and item["fetched_at"] is None
+            and provenance.get("receipt_status") == "UNKNOWN")
+
+
+def research_report(name, item, metadata, *, before, calendar=None, expected_code=None,
+                    preview_unknown_csv_receipt=False):
     """Retrospective observed bars only; `before` is an exclusive Tehran session date."""
     if not isinstance(item, dict) or not isinstance(metadata, dict) or not isinstance(item.get("history"), list):
         raise ValueError("ساختار تاریخچهٔ روزانه نامعتبر است.")
@@ -379,10 +392,17 @@ def research_report(name, item, metadata, *, before, calendar=None, expected_cod
     ):
         raise ValueError("شناسهٔ دارایی پایه نامعتبر یا متعارض است.")
     received = parse_time(item.get("fetched_at"))
+    provenance = csv_provenance(item)
     if received is None:
-        raise ValueError("زمان محلی دریافت با منطقهٔ زمانی لازم است.")
-    # Exclude both the requested day and any bar from the download day (which may be incomplete).
-    cutoff = min(before, received.astimezone(ZoneInfo("Asia/Tehran")).date())
+        archived = parse_time(provenance.get("capture_receipt_tehran")) if provenance else None
+        if not (preview_unknown_csv_receipt and unknown_csv_receipt(item) and archived is not None):
+            raise ValueError("زمان محلی دریافت با منطقهٔ زمانی لازم است.")
+        # Only the importer opts in, after checking the selected archive. This is
+        # a descriptive preview bound to that capture, not a replacement download time.
+        cutoff = min(before, archived.astimezone(ZoneInfo("Asia/Tehran")).date())
+    else:
+        # Exclude the requested day and the download day, which may be incomplete.
+        cutoff = min(before, received.astimezone(ZoneInfo("Asia/Tehran")).date())
     seen, rows, zero_volume, excluded = set(), [], [], 0
     for raw in item["history"]:
         if not isinstance(raw, dict):
@@ -419,10 +439,11 @@ def research_report(name, item, metadata, *, before, calendar=None, expected_cod
     )
     effective_dates = [row["date"] for row in rows]
     date_range = lambda days: [min(days).isoformat(), max(days).isoformat()] if days else None
-    return {
+    report = {
         "symbol": name, "ins_code": code,
         "source": metadata.get("source") or "UNKNOWN",
-        "downloaded_at_utc": received.isoformat(), "session_date_cutoff_exclusive": cutoff.isoformat(),
+        "downloaded_at_utc": received.isoformat() if received is not None else None,
+        "session_date_cutoff_exclusive": cutoff.isoformat(),
         "dataset_date_range": date_range(seen), "valid_close_date_range": date_range(effective_dates),
         "records_before_cutoff": len(seen), "valid_close_count": len(rows), "excluded_at_or_after_cutoff": excluded,
         "volume_present_count": sum(row["volume"] is not None for row in rows),
@@ -445,6 +466,18 @@ def research_report(name, item, metadata, *, before, calendar=None, expected_cod
         },
         "indicators": observed_indicators(rows),
     }
+    if provenance is not None:
+        report.update({
+            "source": CSV_SOURCE_FORMAT,
+            "provenance": {key: provenance[key] for key in (
+                "source_format", "source_url", "http_status", "instrument_page_url", "ticker",
+                "source_evidence", "body_sha256", "byte_count", "identity_verification",
+                "ins_code_present_in_source", "receipt_status", "capture_id", "capture_body_sha256",
+                "capture_receipt_tehran", "seal_sha256", "manifest_sha256",
+            ) if key in provenance} | {"adjustment_status": "UNKNOWN", "point_in_time_verified": False},
+            "point_in_time_verified": False,
+        })
+    return report
 
 
 def main(argv=None):
