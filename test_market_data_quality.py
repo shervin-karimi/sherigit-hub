@@ -683,6 +683,240 @@ class MarketDataQualityTests(unittest.TestCase):
                 self.assertEqual(exit_.exception.code, 2)
                 self.assertFalse(out.getvalue())
 
+    def manifest_fixture(self):
+        codes = ("701", "702", "703", combine.RESEARCH_UNDERLYING)
+        receipt = self.append_rows(22, [
+            row(insCode_C=str(4500 + 2*i), insCode_P=str(4501 + 2*i), uaInsCode=code, lval30_UA=f"پایه {i}")
+            for i, code in enumerate(codes)
+        ])
+        history = self.history_file({"خودرو": self.history_item()})
+        flags = (self.small_csv_overlay("701"), self.small_csv_overlay("702", price=200))
+        manifest = {
+            "version": 1,
+            "capture": {"id": "manual:1", "body_sha256": receipt["body_sha256"],
+                        "integrity_sha256": receipt["head_sha256"]},
+            "entries": [
+                {"path": Path(group[1]).name, "ins_code": group[3], "sha256": group[5],
+                 "instrument_page_url": group[7], "archive_name": f"پایه {i}",
+                 "csv_ticker": f"SYNTHETIC-{group[3]}", "identity_evidence": f"synthetic fixture {i}"}
+                for i, group in enumerate(flags)
+            ],
+        }
+        return history, flags, manifest
+
+    def manifest_cli(self, history, manifest, *, extra=()):
+        path = self.stream.parent / "manifest.json"
+        path.write_text(manifest if isinstance(manifest, str) else json.dumps(manifest), encoding="utf-8")
+        return self.market_cli(history, capture="manual:1",
+                               options=("--history-csv-manifest", str(path), "--format", "json", *extra))
+
+    def test_manifest_cli_matches_direct_report_and_leaves_baseline_unchanged(self):
+        history, flags, manifest = self.manifest_fixture()
+        path = self.stream.parent / "manifest.json"
+        path.write_text(json.dumps(manifest))
+        options = ("--history-csv-manifest", str(path), "--format", "json")
+        snapshot = lambda: {p: p.read_bytes() for p in self.stream.parent.rglob("*") if p.is_file()}
+        before = snapshot()
+        observed = combine.read_market_capture("manual:1", self.stream, watch.DEFAULT_ARCHIVE)
+        with patch.object(combine, "read_market_capture", return_value=observed), \
+                patch.object(combine, "atomic_write", side_effect=AssertionError("write forbidden")), \
+                patch("fetch_underlying_history.prepare_merge", side_effect=AssertionError("merge forbidden")), \
+                patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")), \
+                patch("paper_trading.PaperTrading.buy", side_effect=AssertionError("orders forbidden")):
+            baseline = self.market_cli(history, capture="manual:1", options=("--format", "json"))
+            rc, output, summary = self.market_cli(history, capture="manual:1", options=options)
+            self.assertEqual(before, snapshot())
+            self.assertEqual(self.market_cli(history, capture="manual:1", options=("--format", "json")), baseline)
+            self.assertEqual(self.manifest_cli(history, manifest | {"entries": manifest["entries"][::-1]}),
+                             (rc, output, summary))
+            direct = self.market_cli(history, capture="manual:1", options=(*flags[0], *flags[1], "--format", "json"))
+        self.assertEqual((rc, baseline[0], baseline[2], direct[0], direct[2]), (0, 0, "", 0, ""))
+        self.assertIn("پذیرفته‌شده: پایه 0 (701)، پایه 1 (702)", summary)
+        self.assertIn("پایه 2 (703)", summary)
+        self.assertIn("پوشش فنی: 3 از 4 پایه", summary)
+        from_manifest, normal = json.loads(output), json.loads(baseline[1])
+        for code, entry in zip(("701", "702"), manifest["entries"]):
+            overlay = from_manifest["history_overlays"][code]
+            self.assertEqual(overlay.pop("manifest_entry"), {
+                key: entry[key] for key in ("archive_name", "csv_ticker", "identity_evidence")
+            })
+            self.assertEqual(overlay["valid_closes_before_cutoff"], 24)
+            self.assertEqual(overlay["excluded_at_or_after_cutoff"], 2)
+            self.assertIsNone(overlay["csv_received_at"])
+            self.assertFalse(overlay["point_in_time_verified"])
+        self.assertEqual(from_manifest, json.loads(direct[1]))
+        self.assertEqual(from_manifest["capture_date_cutoff_exclusive"], "2026-11-22")
+        for key in ("options", "risk", "greeks_assumption_status"):
+            self.assertEqual(from_manifest[key], normal[key])
+        for key in ("screening", "research_counts", "option_counts"):
+            self.assertEqual(from_manifest["summary"][key], normal["summary"][key])
+        self.assertEqual(from_manifest["summary"]["screening"]["strict_passes"], 0)
+        self.assertFalse(from_manifest["execution_eligible"])
+        self.assertFalse(from_manifest["point_in_time_verified"])
+        self.assertTrue(all(not option["execution_eligible"] for option in from_manifest["options"]))
+        self.assertNotIn("BUY_READY", output)
+        self.assertNotIn(str(path.parent), output)
+
+    def test_manifest_rejects_invalid_schema_binding_and_operator_attribution(self):
+        history, _, manifest = self.manifest_fixture()
+        entry, second = manifest["entries"]
+        changed = lambda **values: manifest | {"entries": [entry, second | values]}
+        bound = lambda **values: manifest | {"capture": manifest["capture"] | values}
+        cases = (
+            ("{", "JSON مانیفست نامعتبر"),
+            (json.dumps(manifest).replace('"path":', '"path": "duplicate.csv", "path":', 1), "کلید تکراری"),
+            (manifest | {"version": True}, "نسخهٔ مانیفست"),
+            (manifest | {"unexpected": 1}, "فیلدهای مانیفست"),
+            (manifest | {"entries": []}, "غیرخالی"),
+            (manifest | {"entries": [None]}, "مدخل 1"),
+            (bound(id="manual:2"), "تطابق ندارد"),
+            (bound(body_sha256="0"*64), "تطابق ندارد"),
+            (bound(integrity_sha256="0"*64), "تطابق ندارد"),
+            (changed(extra=True), "فیلدهای مدخل"),
+            (changed(ins_code=702), "insCode"),
+            (changed(ins_code="999", instrument_page_url="https://www.tsetmc.com/instInfo/999"), "instrument absent"),
+            (manifest | {"entries": [entry, entry]}, "شناسهٔ پایه تکراری"),
+            (changed(path=entry["path"]), "مسیر یا هش CSV تکراری"),
+            (changed(sha256=entry["sha256"]), "مسیر یا هش CSV تکراری"),
+            (changed(sha256="ABC"), "SHA-256"),
+            (changed(instrument_page_url=entry["instrument_page_url"]), "نشانی صفحهٔ ابزار"),
+            (changed(archive_name="نام دیگر"), "نام پایه"),
+            (changed(identity_evidence=" "), "شاهد انتساب"),
+            (manifest | {"entries": [entry, {k: v for k, v in second.items() if k != "identity_evidence"}]},
+             "فیلدهای مدخل"),
+            (changed(close_policy="repair"), "سیاست CLOSE"),
+            (changed(close_policy="exclude-close-outside-traded-range"), "تأیید صریح اپراتور"),
+            (changed(close_policy="exclude-close-outside-traded-range",
+                     close_approval={"acknowledged": 1, "reason": "not a boolean"}), "تأیید صریح اپراتور"),
+            (changed(close_policy="exclude-close-outside-traded-range",
+                     close_approval={"acknowledged": True, "reason": ""}), "تأیید صریح اپراتور"),
+            (changed(close_approval={"acknowledged": True, "reason": "not requested"}), "حالت سخت‌گیرانه"),
+        )
+        observed = combine.read_market_capture("manual:1", self.stream, watch.DEFAULT_ARCHIVE)
+        with patch.object(combine, "read_market_capture", return_value=observed), \
+                patch("fetch_underlying_history.csv_research_observation",
+                      side_effect=AssertionError("CSV opened before metadata validated")):
+            for document, reason in cases:
+                with self.subTest(reason=reason):
+                    rc, out, err = self.manifest_cli(history, document)
+                    self.assertEqual((rc, out), (1, ""))
+                    self.assertIn(reason, err)
+                    self.assertIn("هیچ CSV فعال نشد", err)
+
+    def test_manifest_rejects_unsafe_files_and_never_returns_partial_json(self):
+        history, _, manifest = self.manifest_fixture()
+        first, second = manifest["entries"]
+        root = self.stream.parent
+        (root / "alias.csv").symlink_to(root / second["path"])
+        (root / "alias-dir").symlink_to(root, target_is_directory=True)
+        (root / "bad.csv").write_bytes(b"invalid CSV")
+        (root / "huge.csv").write_bytes(b"x" * (1024 * 1024 + 1))
+        third = second | {"ins_code": "703", "archive_name": "پایه 2", "path": "not-checked.csv",
+                          "sha256": "f"*64, "instrument_page_url": "https://www.tsetmc.com/instInfo/703"}
+        observed = combine.read_market_capture("manual:1", self.stream, watch.DEFAULT_ARCHIVE)
+        with patch.object(combine, "read_market_capture", return_value=observed):
+            for path in (str(root / second["path"]), "../escape.csv", "a/../b.csv", "./file.csv", "a//b.csv",
+                         "https://invalid.example/data.csv", "a\\b.csv", "a/ b.csv"):
+                with self.subTest(path=path):
+                    rc, out, err = self.manifest_cli(history, manifest | {"entries": [first, second | {"path": path}]})
+                    self.assertEqual((rc, out), (1, ""))
+                    self.assertIn("مسیر نسبی CSV نامعتبر", err)
+                    self.assertIn("هیچ فایل CSV بررسی نشده", err)
+            for update, reason in (
+                ({"path": "missing.csv"}, "No such file"),
+                ({"path": "alias.csv"}, "symbolic links"),
+                ({"path": f"alias-dir/{second['path']}"}, "Not a directory"),
+                ({"path": "bad.csv", "sha256": watch.digest(b"invalid CSV")}, "unexpected CSV header"),
+                ({"path": "huge.csv"}, "file exceeds size limit"),
+                ({"sha256": "0"*64}, "SHA-256 mismatch"),
+                ({"csv_ticker": "not-the-ticker"}, "تیکر CSV با تیکر مورد انتظار"),
+            ):
+                with self.subTest(reason=reason):
+                    entries = [third, second | update, first]
+                    rc, out, err = self.manifest_cli(history, manifest | {"entries": entries})
+                    self.assertEqual((rc, out), (1, ""))
+                    self.assertIn("شناسهٔ 702 رد شد", err)
+                    self.assertIn(reason, err)
+                    self.assertIn("1 بررسی‌شده ولی فعال‌نشده، 1 فایل بررسی‌نشده", err)
+            indexed = combine.history_index(history)
+            size = sum((root / entry["path"]).stat().st_size for entry in (first, second))
+            with patch.object(combine, "history_index", return_value=indexed), patch.object(watch, "MAX_BODY", size - 1):
+                rc, out, err = self.manifest_cli(history, manifest)
+            self.assertEqual((rc, out), (1, ""))
+            self.assertIn("combined CSV inputs exceed size limit", err)
+
+    def test_manifest_strict_policy_and_before_cutoff_minimum(self):
+        history, flags, manifest = self.manifest_fixture()
+        entry, second = manifest["entries"]
+        observed = combine.read_market_capture("manual:1", self.stream, watch.DEFAULT_ARCHIVE)
+        root = self.stream.parent
+        path = root / entry["path"]
+        rows = path.read_text().splitlines()
+        cutoff = "20261122"
+        active_before = [line for line in rows[2:] if line.split(",")[1] < cutoff and int(line.split(",")[7]) > 0]
+        later = [line for line in rows[2:] if line.split(",")[1] >= cutoff]
+
+        def boundary_csv(active):
+            sessions = active_before[:active] + later
+            dates = [line.split(",")[1] for line in sessions]
+            self.assertEqual(len(dates), len(set(dates)))
+            self.assertEqual(sum(day < cutoff for day in dates), active)
+            self.assertGreater(active + len(later), 21)
+            raw = ("\n".join(rows[:2] + sessions) + "\n").encode()
+            return self.small_csv_overlay("701", raw=raw)
+
+        cells = rows[2].split(",")
+        cells[5] = "103"
+        rows[2] = ",".join(cells)
+        path.write_text("\n".join(rows) + "\n")
+        entry = entry | {"sha256": watch.digest(path.read_bytes())}
+        batch = lambda candidate: manifest | {"entries": [candidate, second]}
+        with patch.object(combine, "read_market_capture", return_value=observed):
+            rc, out, err = self.manifest_cli(history, batch(entry))
+            self.assertEqual((rc, out), (1, ""))
+            self.assertIn("inconsistent active CSV OHLC/last", err)
+            approved = entry | {"close_policy": "exclude-close-outside-traded-range",
+                                "close_approval": {"acknowledged": True, "reason": "synthetic sensitivity"}}
+            rc, out, _ = self.manifest_cli(history, batch(approved))
+            self.assertEqual(rc, 0)
+            report = json.loads(out)
+            filtered = report["history_overlays"]["701"]
+            self.assertEqual(filtered["close_filter"]["flagged_rows"][0]["source_fields"]["<CLOSE>"], "103")
+            self.assertEqual(filtered["manifest_entry"]["close_approval"], approved["close_approval"])
+            self.assertEqual(filtered["valid_closes_before_cutoff"], 23)
+            self.assertEqual(report["underlyings"]["701"]["technical_analysis"]["history"]["indicators"]["SMA(20)"]["value"], 100)
+            short = boundary_csv(20)
+            rc, out, err = self.manifest_cli(history, batch(entry | {"sha256": short[5]}))
+            self.assertEqual((rc, out), (1, ""))
+            self.assertIn("کمتر از ۲۱ جلسهٔ فعال", err)
+            rc, direct, err = self.market_cli(history, capture="manual:1", options=(*short, *flags[1], "--format", "json"))
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(json.loads(direct)["history_overlays"]["701"]["valid_closes_before_cutoff"], 20)
+            enough = boundary_csv(21)
+            rc, out, _ = self.manifest_cli(history, batch(entry | {"sha256": enough[5]}))
+            self.assertEqual(rc, 0)
+            report = json.loads(out)
+            overlay = report["history_overlays"]["701"]
+            self.assertEqual(overlay["session_date_cutoff_exclusive"], "2026-11-22")
+            self.assertEqual(overlay["valid_closes_before_cutoff"], 21)
+            self.assertEqual(overlay["excluded_at_or_after_cutoff"], len(later))
+            metrics = report["underlyings"]["701"]["technical_analysis"]["history"]["indicators"]
+            self.assertEqual(metrics["SMA(20)"]["value"], 100)
+
+    def test_manifest_arg_is_exclusive_and_cannot_fall_through_to_legacy_writer(self):
+        flag = ("--history-csv-manifest", "manifest.json")
+        cases = (flag, ("--research", "--capture", "manual:2", "--underlying-code", combine.RESEARCH_UNDERLYING, *flag),
+                 ("--research", "--capture", "manual:2", "--all-underlyings", *flag, "--history-csv", "raw.csv"),
+                 ("--research", "--capture", "manual:2", "--all-underlyings", *flag, *flag),
+                 ("--research", "--capture", "manual:2", "--all-underlyings", *flag, "--apply"))
+        for args in cases:
+            with self.subTest(args=args), patch.object(sys, "argv", [combine.__file__, *args]), \
+                    patch.object(combine, "read_market_capture", side_effect=AssertionError("unexpected archive access")), \
+                    redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()), self.assertRaises(SystemExit) as exit_:
+                runpy.run_path(combine.__file__, run_name="__main__")
+            self.assertEqual(exit_.exception.code, 2)
+            self.assertEqual(out.getvalue(), "")
+
     def test_market_cli_discovers_twenty_bases_and_replays_selected_capture_once_per_call(self):
         code = combine.RESEARCH_UNDERLYING
         bases = [code, *(str(500 + i) for i in range(19))]

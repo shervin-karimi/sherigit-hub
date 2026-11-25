@@ -550,6 +550,79 @@ def csv_argument_groups(fields):
     return tuple(groups)
 
 
+def read_csv_manifest(path, observed, capture):
+    import fetch_underlying_history as fetch
+    import shadow_watch as watch
+
+    def unique_object(pairs):
+        obj = dict(pairs)
+        watch.require(len(obj) == len(pairs), "کلید تکراری در JSON مانیفست")
+        return obj
+
+    def text(value):
+        return isinstance(value, str) and 0 < len(value) <= 512 and value == value.strip() and value.isprintable()
+
+    with fetch.pinned_path(path) as file:
+        raw, _ = file.read(watch.MAX_META)
+        directory = file.path.parent
+    try:
+        manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("JSON مانیفست نامعتبر است") from error
+    watch.require(isinstance(manifest, dict) and manifest.keys() == {"version", "capture", "entries"},
+                  "فیلدهای مانیفست ناقص یا ناشناخته‌اند")
+    watch.require(type(manifest["version"]) is int and manifest["version"] == 1, "نسخهٔ مانیفست پشتیبانی نمی‌شود")
+    binding = manifest["capture"]
+    watch.require(isinstance(binding, dict) and binding.keys() == {"id", "body_sha256", "integrity_sha256"}
+                  and fetch.is_sha256(binding["body_sha256"]) and fetch.is_sha256(binding["integrity_sha256"])
+                  and binding["id"] == capture["capture_id"] and binding["body_sha256"] == capture["body_sha256"]
+                  and binding["integrity_sha256"] == (capture["seal_sha256"] or capture["manifest_sha256"]),
+                  "شناسه، هش بدنه یا مهر/مانیفست آرشیو با ثبت اعتبارسنجی‌شده تطابق ندارد")
+    entries = manifest["entries"]
+    watch.require(isinstance(entries, list) and entries, "فهرست مدخل‌های مانیفست باید غیرخالی باشد")
+    bases = {code: group["symbols"] for code, group in observed["by_underlying_id"].items()}
+    capture = capture | {"diagnostics": observed["diagnostics"]}
+    required = {"path", "ins_code", "sha256", "instrument_page_url", "archive_name", "csv_ticker", "identity_evidence"}
+    overlays, evidence = [], {}
+    for index, entry in enumerate(entries, 1):
+        code = entry.get("ins_code") if isinstance(entry, dict) else None
+        label = f"مدخل {index}" + (f" (شناسهٔ {code})" if watch.positive_id(code) else "")
+        try:
+            watch.require(isinstance(entry, dict) and required <= entry.keys()
+                          <= required | {"close_policy", "close_approval"}, "فیلدهای مدخل ناقص یا ناشناخته‌اند")
+            watch.require(watch.positive_id(code), "insCode باید رشتهٔ معتبر باشد")
+            watch.require(fetch.is_sha256(entry["sha256"]), "SHA-256 فایل نامعتبر است")
+            watch.require(entry["instrument_page_url"] == fetch.INSTRUMENT_PAGE + code,
+                          "نشانی صفحهٔ ابزار با شناسه تطابق ندارد")
+            names = fetch.capture_symbols(capture, bases, code, csv_source=True)
+            watch.require(entry["archive_name"] == names[0], "نام پایه با نام ثبت‌شده در آرشیو تطابق ندارد")
+            watch.require(text(entry["csv_ticker"]) and text(entry["identity_evidence"]),
+                          "تیکر مورد انتظار یا شاهد انتساب دستی معتبر نیست")
+            relative = entry["path"]
+            watch.require(text(relative) and "\\" not in relative and ":" not in relative
+                          and all(part not in ("", ".", "..") and part == part.strip()
+                                  for part in relative.split("/"))
+                          and relative.lower().endswith(".csv"), "مسیر نسبی CSV نامعتبر است")
+            policy = entry.get("close_policy", "strict")
+            watch.require(policy in fetch.CSV_CLOSE_POLICIES, "سیاست CLOSE نامعتبر است")
+            if policy != "strict":
+                approval = entry.get("close_approval")
+                watch.require(isinstance(approval, dict) and approval.keys() == {"acknowledged", "reason"}
+                              and approval["acknowledged"] is True and text(approval["reason"]),
+                              "حذف CLOSE به تأیید صریح اپراتور و دلیل نیاز دارد")
+            else:
+                watch.require("close_approval" not in entry, "تأیید حذف CLOSE در حالت سخت‌گیرانه مجاز نیست")
+            watch.require(code not in evidence, "شناسهٔ پایه تکراری است")
+        except ValueError as error:
+            raise ValueError(f"{label} رد شد: {error}؛ هیچ فایل CSV بررسی نشده است") from error
+        overlays.append({"source": directory / relative, "code": code, "source_sha256": entry["sha256"],
+                         "instrument_page_url": entry["instrument_page_url"],
+                         **({"close_policy": policy} if "close_policy" in entry else {})})
+        evidence[code] = {key: entry[key] for key in ("archive_name", "csv_ticker", "identity_evidence",
+                                                     "close_approval") if key in entry}
+    return overlays, evidence
+
+
 def csv_overlay_history(indexed, overlay, bases, capture, receipt):
     import analyze_underlying_trends_v2 as trends
     import fetch_underlying_history as fetch
@@ -604,7 +677,7 @@ def csv_overlay_history(indexed, overlay, bases, capture, receipt):
     return technical, provenance
 
 
-def market_csv_overlays(indexed, overlays, observed, capture, receipt):
+def market_csv_overlays(indexed, overlays, observed, capture, receipt, *, manifest_evidence=None):
     import fetch_underlying_history as fetch
     import shadow_watch as watch
 
@@ -623,13 +696,17 @@ def market_csv_overlays(indexed, overlays, observed, capture, receipt):
         watch.require(fetch.is_sha256(digest), f"invalid expected provider SHA-256: {code}")
         watch.require(isinstance(source, (str, Path)) and source, f"invalid CSV path: {code}")
         path = Path(source).absolute()
-        watch.require(digest not in hashes and path not in paths, f"duplicate CSV overlay source (path or hash): {code}")
+        if manifest_evidence is not None:
+            watch.require(digest not in hashes and path not in paths,
+                          f"شناسهٔ {code} رد شد: مسیر یا هش CSV تکراری است؛ هیچ فایل CSV بررسی نشده است")
+        else:
+            watch.require(digest not in hashes and path not in paths, f"duplicate CSV overlay source (path or hash): {code}")
         codes.add(code)
         hashes.add(digest)
         paths.add(path)
     technical, provenance, tickers, size = {}, {}, set(), 0
     capture = capture | {"diagnostics": observed["diagnostics"]}
-    for overlay in sorted(overlays, key=lambda entry: entry["code"]):
+    for checked, overlay in enumerate(sorted(overlays, key=lambda entry: entry["code"])):
         code = overlay["code"]
         try:
             analysis, evidence = csv_overlay_history(indexed, overlay, bases, capture, receipt)
@@ -637,7 +714,19 @@ def market_csv_overlays(indexed, overlays, observed, capture, receipt):
             watch.require(size <= watch.MAX_BODY, "combined CSV inputs exceed size limit")
             ticker = fetch.name_key(evidence["csv"]["ticker"])
             watch.require(ticker not in tickers, "conflicting CSV ticker across distinct instrument IDs")
+            if manifest_evidence is not None:
+                operator = manifest_evidence[code]
+                watch.require(evidence["csv"]["ticker"] == operator["csv_ticker"],
+                              "تیکر CSV با تیکر مورد انتظار اپراتور تطابق ندارد")
+                watch.require(evidence["valid_closes_before_cutoff"] >= fetch.REQUIRED_HISTORY,
+                              "کمتر از ۲۱ جلسهٔ فعال و معتبر پیش از برش انحصاری تهران")
+                evidence["manifest_entry"] = operator
         except (OSError, ValueError, ArithmeticError) as error:
+            if manifest_evidence is not None:
+                reason = error.strerror if isinstance(error, OSError) else str(error)
+                raise ValueError(f"شناسهٔ {code} رد شد: {reason}؛ "
+                                 f"{checked} بررسی‌شده ولی فعال‌نشده، "
+                                 f"{len(overlays) - checked - 1} فایل بررسی‌نشده") from error
             raise ValueError(f"CSV overlay {code}: {error}") from error
         tickers.add(ticker)
         technical[code], provenance[code] = analysis, evidence
@@ -647,7 +736,8 @@ def market_csv_overlays(indexed, overlays, observed, capture, receipt):
     return technical, provenance
 
 
-def build_market_research_report(capture_id, *, stream, legacy_archive, history_path, csv_overlay=None, csv_overlays=()):
+def build_market_research_report(capture_id, *, stream, legacy_archive, history_path, csv_overlay=None,
+                                 csv_overlays=(), csv_manifest=None):
     import greeks_evidence_registry as evidence
     import shadow_watch as watch
 
@@ -658,8 +748,14 @@ def build_market_research_report(capture_id, *, stream, legacy_archive, history_
     if csv_overlay is not None:
         watch.require(not csv_overlays, "use either csv_overlay or csv_overlays, not both")
         csv_overlays = (csv_overlay,)
+    manifest_evidence = None
+    if csv_manifest is not None:
+        watch.require(not csv_overlays, "مانیفست با گروه‌های مستقیم CSV قابل ترکیب نیست")
+        csv_overlays, manifest_evidence = read_csv_manifest(csv_manifest, observed, capture)
     overlay_technical, overlay_provenance = (
-        market_csv_overlays(indexed, csv_overlays, observed, capture, receipt) if csv_overlays else ({}, {})
+        market_csv_overlays(indexed, csv_overlays, observed, capture, receipt,
+                            **({"manifest_evidence": manifest_evidence} if manifest_evidence is not None else {}))
+        if csv_overlays else ({}, {})
     )
     evaluated = capture["screening_status"] == "existing_replay"
     options, grouped = [], defaultdict(list)
@@ -713,6 +809,22 @@ def build_market_research_report(capture_id, *, stream, legacy_archive, history_
             "شاخص‌های CSV فیلترشده فقط سناریوی حساسیت محافظه‌کارانه‌اند؛ تاریخچهٔ رسمی بازسازی نشده است."
         )
     return report
+
+
+def csv_manifest_summary(report):
+    approved = report.get("history_overlays") or {report["history_overlay"]["ins_code"]: report["history_overlay"]}
+    bases = report["underlyings"]
+
+    def labels(codes):
+        return "، ".join(f'{"/".join(bases[code]["symbols"])} ({code})' for code in sorted(codes)) or "—"
+
+    missing = [code for code, base in bases.items() if base["technical_analysis"]["status"] == "NOT_AVAILABLE"]
+    return "\n".join((
+        f"مانیفست CSV — پذیرفته‌شده: {labels(approved)}؛ ردشده: ۰.",
+        f"بدون تاریخچه یا تحلیل قابل استفاده: {labels(missing)}.",
+        f"پوشش فنی: {report['summary']['technical_available_count']} از {len(bases)} پایه.",
+        "فقط پژوهش: هویت منتسب به اپراتور است؛ زمان دریافت، تعدیل و دسترسی تاریخی تأیید نشده‌اند.",
+    ))
 
 
 def market_summary(report):
@@ -775,13 +887,17 @@ def research_main(argv):
     parser.add_argument("--stream", type=Path, default=collector.STREAM)
     parser.add_argument("--legacy-archive", type=Path, default=watch.DEFAULT_ARCHIVE)
     parser.add_argument("--history", type=Path, default=BASE / "data" / "underlying_history.json")
+    parser.add_argument("--history-csv-manifest", type=Path, action="append",
+                        help="مانیفست محلی CSV؛ فقط برای پژوهش کل بازار")
     for flag, key in CSV_OVERLAY_FLAGS.items():
         parser.add_argument(flag, dest="csv_fields", action=CSVOverlayField, type=Path if key == "source" else str,
                             choices=fetch.CSV_CLOSE_POLICIES if key == "close_policy" else None,
                             help="آغاز گروه CSV محلی؛ فقط در پژوهش کل بازار" if key == "source" else None)
     args = parser.parse_args(argv)
-    if args.csv_fields and not args.all_underlyings:
+    if (args.csv_fields or args.history_csv_manifest) and not args.all_underlyings:
         parser.error("هم‌پوشان CSV فقط با --all-underlyings مجاز است.")
+    if args.history_csv_manifest and (len(args.history_csv_manifest) != 1 or args.csv_fields):
+        parser.error("یک مانیفست CSV بدون پرچم‌های مستقیم CSV لازم است.")
     try:
         csv_overlays = csv_argument_groups(args.csv_fields)
     except ValueError as error:
@@ -792,14 +908,22 @@ def research_main(argv):
         if args.all_underlyings:
             report = build_market_research_report(args.capture, stream=args.stream,
                                                   legacy_archive=args.legacy_archive, history_path=args.history,
+                                                  **({"csv_manifest": args.history_csv_manifest[0]}
+                                                     if args.history_csv_manifest else {}),
                                                   **({"csv_overlays": csv_overlays} if csv_overlays else {}))
             output = (json.dumps(report, ensure_ascii=False, allow_nan=False, sort_keys=True)
                       if args.format == "json" else market_summary(report))
         else:
             report = build_research_report(args.capture, args.underlying_code, stream=args.stream, history_path=args.history)
             output = json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True)
+        if args.history_csv_manifest:
+            print(csv_manifest_summary(report), file=sys.stderr)
         print(output)
     except (OSError, ValueError, ZoneInfoNotFoundError, TimeoutExpired) as error:
+        if args.history_csv_manifest:
+            reason = error.strerror if isinstance(error, OSError) else str(error)
+            print(f"مانیفست پذیرفته نشد؛ هیچ CSV فعال نشد و پوشش جدید محاسبه نشد: {reason}", file=sys.stderr)
+            return 1
         print(f"گزارش پژوهشی در دسترس نیست: {error}", file=sys.stderr)
         return 1
     return 0
