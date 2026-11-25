@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the TSETMC shadow pilot once per minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=1s
+Persistent=true
+Unit=shadow-pilot.service
+
+[Install]
+WantedBy=timers.target

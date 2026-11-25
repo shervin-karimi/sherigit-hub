@@ -1,0 +1,12 @@
+[Unit]
+Description=TSETMC shadow observation and paper-only pilot tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sherigit-hub
+ExecStart=/usr/bin/python3 -B /opt/sherigit-hub/shadow_pilot.py tick --config %h/.config/sherigit-pilot/config.json
+UMask=0077
+NoNewPrivileges=yes
+TimeoutStartSec=90
+StandardOutput=null

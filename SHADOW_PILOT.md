@@ -1,0 +1,108 @@
+# Live shadow pilot
+
+The Linux pilot reads the public TSETMC watchlist only in the supplied dated
+Tehran sessions and configured collection windows. Each tick reserves its
+attempt on disk before starting HTTP. It makes at most one request and enforces
+a configured interval of at least 60 seconds across restarts, including failed
+attempts. The observation archive stores raw bodies, HTTP receipts and an
+append-only chain of seals. Duplicate bodies do not create another observation.
+Inspect or restore a corrupt archive before continuing.
+
+The day’s Persian JSON report is atomically replaced on each completed tick.
+It includes the last valid snapshot’s full CALL/PUT shortlist and first
+rejection reasons, coverage, bot-owned positions and exits, configured limits,
+remaining daily buy capacity, per-order sell capacity when a valid bid is
+available, and critical alerts. There is no daily sell limit in the existing
+policy. The report shows this field as null and applies the existing per-order
+and inventory limits. Status flags an incomplete or stale heartbeat after
+three minutes. The archive and reports stay local, under the configured private
+root. Full-chain validation increases tick cost as the archive grows. Monitor
+runtime and disk space, and start a new private observation-only root when
+retiring a large pilot archive after preserving it.
+
+## Linux VPS setup
+
+Use Python 3.10 or newer with system IANA timezone data and a dedicated
+unprivileged Linux account. Place the checkout at `/opt/sherigit-hub` or adjust
+both paths in the service unit. The following commands assume a user systemd
+session. An administrator may enable lingering for that account if the timer
+must run after logout.
+
+Create `~/.config/sherigit-pilot/config.json` with mode 0600. Use absolute
+paths and supply an operator-verified Tehran trading calendar in the dated
+format expected by `shadow_schedule.py`. The windows below describe desired
+collection hours and must be set for the deployment.
+
+```json
+{
+  "root": "/home/pilot/.local/share/sherigit-pilot",
+  "calendar": "/home/pilot/.config/sherigit-pilot/sessions.json",
+  "windows": ["09:00-12:30"],
+  "capture_interval_seconds": 120
+}
+```
+
+```sh
+python3 -B shadow_pilot.py check --config ~/.config/sherigit-pilot/config.json
+install -d ~/.config/systemd/user
+install -m 644 deploy/shadow-pilot.service deploy/shadow-pilot.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shadow-pilot.timer
+systemctl --user list-timers shadow-pilot.timer
+python3 -B shadow_pilot.py status --config ~/.config/sherigit-pilot/config.json
+journalctl --user -u shadow-pilot.service
+systemctl --user disable --now shadow-pilot.timer
+systemctl --user stop shadow-pilot.service
+```
+
+`check` makes no HTTP request or paper-ledger change. Read reports under
+`<root>/reports/YYYY-MM-DD.json`. The service suppresses report bodies in the
+journal. Back up the archive, report files, durable state and any opted-in
+SQLite ledger securely. Respect the venue’s collection policy and provide
+accurate clock synchronization. Omitted and out-of-session days do not fetch.
+
+## Independent paper evidence
+
+The default is observation-only. TSETMC HTTP receipt time, HTTP headers and
+research candidates cannot become executable paper quotes. Pilot ticks may
+advance time-driven pending/expiry state for configured bot-owned positions
+without pricing a fill. Official settlement reconciliation is outside the
+pilot and remains blocked in `EXPIRY_REVIEW`.
+
+To opt in only after reviewing a separately controlled producer, add a
+`paper` object with absolute paths for `db`, `catalog`, `policy`, `feed`
+and `key`. These must sit outside the observation root. Initialize a
+dedicated paper ledger with `trade_manager.py paper init`, use files owned by
+the pilot user with mode 0600, and keep the database and SQLite sidecars in a
+private directory. The trusted producer must attest exchange quote and local
+receipt timestamps, source, identity, multiplier and contract cutoff. For
+entry signals it must independently check the screening facts. A signature
+authenticates that producer’s assertions. Provenance still depends on the
+operator's verification of the producer, the contract catalog and the
+underlying official evidence.
+
+The key contains 32–64 raw bytes provisioned outside Git. The producer
+atomically replaces the feed with a JSON object containing `payload` and
+`hmac_sha256`, the lowercase HMAC-SHA256 of the canonical UTF-8 payload
+(`shadow_collector.json_bytes`, including its final newline). Payload schema 1
+has `schema`, strictly increasing positive integer `sequence`, `issued_at`,
+an independently auditable `evidence_ref`, `quotes`, and `entries`. Quotes
+use the `PAPER_TRADING.md` schema. Each entry has `ins_code`, `market` (the
+replay screening object), `quantity` and a stable unique `order_id`. Quotes
+must match the catalog and the present Tehran session. The pilot applies
+normal freshness, entry, quantity, capital, stop-loss, exit and expiry rules.
+The public scanner submits no entry instructions. The pilot cannot settle or
+send orders to a broker.
+
+Keep a claimed batch available until `last_sequence` acknowledges it in
+status. The batch digest and evidence reference are recorded locally before
+paper writes. If the process stops after a paper write but before acknowledgment,
+the same fresh batch can be retried without duplicating orders. Stale batches
+require new evidence. A blocked required exit stays pending and raises a
+critical alert. A sequence with conflicting evidence or an out-of-order
+batch is rejected. Keep the same pilot root for the configured bot/strategy
+and ledger; review its audit history before moving it or rotating trust.
+
+The deterministic tests use temporary ledgers and synthetic HTTP responses.
+They do not validate production market coverage, source authenticity, an
+official trading calendar or settlement documents.
