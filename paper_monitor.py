@@ -65,6 +65,7 @@ class PaperMonitor:
 
     def cycle(self, records):
         ledger = self.ledger
+        ledger.require_policy()
         with ledger.transaction() as db:
             now = timestamp(ledger.clock())
             ledger._account(db)
@@ -80,20 +81,29 @@ class PaperMonitor:
             else:
                 incident(db, "feed", "warning", state, now)
             for row in ledger._open(db):
+                if not ledger.owns(row):
+                    continue
                 pid = row["id"]
                 blocked = ledger.observe_position(db, row, now)
                 if blocked in ("expired", "unverified"):
                     resolve(db, f"quote:{pid}", now)
+                    if ledger.due(row, now):
+                        incident(db, f"failed_exit:{pid}", "critical", blocked, now)
                     continue
                 quote = quotes.get(row["ins_code"])
                 if quote is None:
                     incident(db, f"quote:{pid}", "warning", "quote missing, stale or unsafe", now)
+                    if blocked == "overdue":
+                        incident(db, f"failed_exit:{pid}", "critical", "no executable exit quote", now)
                     continue
+                sale = (f"monitor:{pid}", row["remaining"], "required_exit") if blocked == "overdue" else None
                 try:
-                    ledger.apply_quote(db, row, quote, now, sell=(blocked == "overdue"))
+                    ledger.apply_quote(db, row, quote, now, sale=sale)
                     resolve(db, f"processing:{pid}", now)
                 except ValueError as error:
                     incident(db, f"processing:{pid}", "critical", str(error), now)
+                    if sale is not None:
+                        incident(db, f"failed_exit:{pid}", "critical", str(error), now)
             resolve(db, "monitor_error", now)
             heartbeat(db, now, self.interval, "running", state, success=True)
 

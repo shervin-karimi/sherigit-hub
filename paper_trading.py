@@ -7,6 +7,7 @@ from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from paper_limits import BotPolicy
 from paper_quotes import MAX_QUOTE_AGE, MAX_SQLITE_INT, TEHRAN, Instrument, Quote, positive_int, text, timestamp
 
 
@@ -69,6 +70,38 @@ UPGRADE = (
 )
 
 
+OWNERSHIP_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS paper_ownership (
+        position_id INTEGER PRIMARY KEY REFERENCES positions(id),
+        bot_id TEXT NOT NULL, strategy_id TEXT NOT NULL,
+        remaining INTEGER NOT NULL CHECK (remaining >= 0)
+    )""",
+    """CREATE TABLE IF NOT EXISTS paper_exits (
+        order_id TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
+        position_id INTEGER NOT NULL REFERENCES paper_ownership(position_id),
+        bot_id TEXT NOT NULL, strategy_id TEXT NOT NULL,
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        price INTEGER NOT NULL CHECK (price > 0), filled_at TEXT NOT NULL,
+        quote TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS paper_exits_position ON paper_exits(position_id)""",
+)
+
+POSITION_ROWS = """SELECT p.*, o.bot_id, o.strategy_id, o.remaining
+    FROM positions p LEFT JOIN paper_ownership o ON o.position_id = p.id"""
+
+
+def order_key(value):
+    value = text(value, "order_id")
+    if len(value) > 128 or value.startswith("monitor:"):
+        raise ValueError("invalid or reserved order_id")
+    return value
+
+
+def request_hash(*values):
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
 def incident(db, key, severity, detail, now):
     db.execute(
         """INSERT OR IGNORE INTO paper_incidents (incident_key, severity, opened_at, detail)
@@ -84,7 +117,10 @@ def resolve(db, key, now):
 
 
 class PaperTrading:
-    def __init__(self, path=DB_PATH, clock=None, *, catalog=None, sessions=None):
+    def __init__(self, path=DB_PATH, clock=None, *, catalog=None, sessions=None, policy=None):
+        if policy is not None and not isinstance(policy, BotPolicy):
+            raise ValueError("invalid bot policy")
+        self.policy = policy
         self.path = Path(path)
         self.clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
         self.catalog = {} if catalog is None else catalog
@@ -108,7 +144,8 @@ class PaperTrading:
             if creating:
                 for statement in SCHEMA:
                     db.execute(statement)
-            if not self._has_table(db, "paper_state") or not self._has_trade_cutoff(db):
+            if (not self._has_table(db, "paper_state") or not self._has_trade_cutoff(db)
+                    or not self._has_table(db, "paper_exits")):
                 if not write:
                     db.rollback()
                     db.execute("BEGIN IMMEDIATE")
@@ -119,6 +156,8 @@ class PaperTrading:
                         db.execute(statement)
                 if not self._has_trade_cutoff(db):
                     db.execute("ALTER TABLE positions ADD COLUMN trade_cutoff_at TEXT")
+                for statement in OWNERSHIP_SCHEMA:
+                    db.execute(statement)
             yield db
 
     @staticmethod
@@ -139,36 +178,58 @@ class PaperTrading:
 
     def buy(self, data, quantity, *, order_id):
         positive_int(quantity, "quantity")
-        order_id = text(order_id, "order_id")
-        if len(order_id) > 128:
-            raise ValueError("order_id must be at most 128 characters")
-        digest = hashlib.sha256(json.dumps([data, quantity], sort_keys=True).encode()).hexdigest()
+        policy = self.require_policy()
+        order_id = order_key(order_id)
+        digest = request_hash(data, quantity)
         with self.transaction() as db:
             now = timestamp(self.clock())
             account = self._account(db)
-            existing = db.execute("SELECT * FROM positions WHERE order_id = ?", (order_id,)).fetchone()
+            existing = db.execute(POSITION_ROWS + " WHERE p.order_id = ?", (order_id,)).fetchone()
             if existing is not None:
-                if existing["request_hash"] != digest:
+                if not self.owns(existing) or existing["request_hash"] != digest:
                     raise ValueError("order_id already used with a different request")
-                return self._view(existing, now, account["stop_loss_bps"])
+                return self._view(db, existing, now, account["stop_loss_bps"])
+            if db.execute("SELECT 1 FROM paper_exits WHERE order_id = ?", (order_id,)).fetchone():
+                raise ValueError("order_id already used for a sell")
             open_trades = self._open(db)
-            blocked = [self.observe_position(db, row, now) for row in open_trades]
+            blocked = [
+                self.observe_position(db, row, now) if self.owns(row)
+                else bool(self.due(row, now) or self.settlement_required(row, now, self.trade_cutoff(row))
+                          or self.matching_instrument(row) is None or self.trade_cutoff(row) is None)
+                for row in open_trades
+            ]
             if not any(blocked) and not self._paused(db):
                 quote = Quote.parse(data, now, self.catalog)
-                return self._buy(db, quote, quantity, order_id, digest, now, account, open_trades)
+                return self._buy(db, quote, quantity, order_id, digest, now, account, open_trades, policy)
         # Commit recorded incidents even when the entry is rejected.
         if any(blocked):
             raise ValueError("exit overdue or resolve expired/unverified paper positions before buying")
         raise ValueError("paper entries are paused")
 
-    def _buy(self, db, quote, quantity, order_id, digest, now, account, open_trades):
+    def _buy(self, db, quote, quantity, order_id, digest, now, account, open_trades, policy):
         instrument = quote.instrument
         cost = quote.ask * instrument.contract_size * quantity
+        for row in open_trades:
+            if row["bot_id"] is not None:
+                self.verify_inventory(db, row)
         allocated = sum(self._cost(row) for row in open_trades)
         if allocated + cost > account["initial_equity"] // 10:
             raise ValueError("total open purchase cost would exceed 10% of initial equity")
         if cost > account["cash"]:
             raise ValueError("insufficient paper cash")
+        limits = policy.limits
+        purchased, loss = self.daily_usage(db, now)
+        if loss is None or loss >= limits.max_daily_loss:
+            raise ValueError("daily loss limit reached or loss evidence unavailable")
+        for actual, limit, label in (
+            (quantity, limits.max_buy_quantity, "buy quantity"),
+            (cost, limits.max_buy_value, "buy order value"),
+            (quote.ask, limits.max_buy_price, "buy limit price"),
+            (purchased + cost, limits.max_daily_purchase_value, "daily purchase value"),
+            (allocated + cost, limits.max_open_exposure, "total open exposure"),
+        ):
+            if actual > limit:
+                raise ValueError(f"{label} limit exceeded")
         deadline = instrument.pre_last_trade_deadline()
         first = instrument.first_trading_date
         if first is None or deadline is None or first.isoformat() not in self.sessions:
@@ -197,35 +258,73 @@ class PaperTrading:
              audit, audit, instrument.expires_at.isoformat(), instrument.trade_cutoff().isoformat()),
         )
         db.execute("UPDATE account SET cash = cash - ? WHERE id = 1", (cost,))
-        row = db.execute("SELECT * FROM positions WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return self._view(row, now, account["stop_loss_bps"])
+        db.execute("INSERT INTO paper_ownership VALUES (?, ?, ?, ?)",
+                   (cur.lastrowid, policy.bot_id, policy.strategy_id, quantity))
+        row = self.position(db, cur.lastrowid)
+        return self._view(db, row, now, account["stop_loss_bps"])
+
+    def require_policy(self):
+        if self.policy is None:
+            raise ValueError("verified bot identity and paper limits are required")
+        return self.policy
+
+    def owns(self, row):
+        return self.policy is not None and row is not None and (
+            row["bot_id"], row["strategy_id"]
+        ) == (self.policy.bot_id, self.policy.strategy_id)
+
+    @staticmethod
+    def position(db, position_id):
+        return db.execute(POSITION_ROWS + " WHERE p.id = ?", (position_id,)).fetchone()
 
     def mark(self, position_id, data):
-        """Update the bid mark without submitting an exit."""
-        return self._update(position_id, data, sell=False)
+        """Update an owned bid mark without submitting an exit."""
+        return self._update(position_id, data)
 
-    def sell(self, position_id, data):
-        return self._update(position_id, data, sell=True)
+    def sell(self, position_id, data, *, order_id, quantity=None):
+        order_id = order_key(order_id)
+        if quantity is not None:
+            positive_int(quantity, "sell quantity")
+        return self._update(position_id, data, sale=(order_id, quantity))
 
-    def _update(self, position_id, data, *, sell):
+    def _update(self, position_id, data, *, sale=None):
         positive_int(position_id, "position id")
+        self.require_policy()
         with self.transaction() as db:
             now = timestamp(self.clock())
             account = self._account(db)
-            row = db.execute(
-                "SELECT * FROM positions WHERE id = ? AND closed_at IS NULL", (position_id,)
-            ).fetchone()
-            if row is None:
+            row = self.position(db, position_id)
+            if not self.owns(row):
+                raise ValueError("position ownership cannot be verified")
+            if sale is not None:
+                order_id, quantity = sale
+                digest = request_hash(position_id, data, quantity)
+                previous = db.execute("SELECT * FROM paper_exits WHERE order_id = ?", (order_id,)).fetchone()
+                if previous is not None:
+                    if not self.owns(previous) or previous["request_hash"] != digest:
+                        raise ValueError("order_id already used with a different request or owner")
+                    return self._view(db, row, now, account["stop_loss_bps"])
+                if db.execute("SELECT 1 FROM positions WHERE order_id = ?", (order_id,)).fetchone():
+                    raise ValueError("order_id already used for a buy")
+                sale = (order_id, quantity if quantity is not None else row["remaining"], digest)
+            if row["closed_at"] is not None:
                 raise ValueError("open paper position not found")
             blocked = self.observe_position(db, row, now)
-            if blocked not in ("expired", "unverified"):
-                quote = Quote.parse(data, now, self.catalog)
-                self.apply_quote(db, row, quote, now, sell=sell)
-                row = db.execute("SELECT * FROM positions WHERE id = ?", (position_id,)).fetchone()
-                return self._view(row, now, account["stop_loss_bps"])
-        if blocked == "expired":
-            raise ValueError("trading has ended; official settlement evidence is required")
-        raise ValueError("verified contract metadata or final trading date is unavailable")
+            if blocked == "expired":
+                error = ValueError("trading has ended; official settlement evidence is required")
+            elif blocked == "unverified":
+                error = ValueError("verified contract metadata or final trading date is unavailable")
+            else:
+                try:
+                    quote = Quote.parse(data, now, self.catalog)
+                    self.apply_quote(db, row, quote, now, sale=sale)
+                except ValueError as failure:
+                    error = failure
+                else:
+                    return self._view(db, self.position(db, position_id), now, account["stop_loss_bps"])
+            if sale is not None and self.due(row, now):
+                incident(db, f"failed_exit:{position_id}", "critical", str(error), now)
+        raise error
 
     @staticmethod
     def _paused(db):
@@ -278,6 +377,8 @@ class PaperTrading:
 
     def observe_position(self, db, row, now):
         """Persist exit requests and return why a position blocks entries, if any."""
+        if not self.owns(row):
+            raise ValueError("position ownership cannot be verified")
         pid = row["id"]
         deadline = self.exit_deadline(row)
         if deadline < timestamp(row["exit_due_at"]):
@@ -334,42 +435,122 @@ class PaperTrading:
         ):
             raise ValueError("source changed or conflicting prices at same quote timestamp")
 
-    def apply_quote(self, db, row, quote, now, *, sell):
+    def apply_quote(self, db, row, quote, now, *, sale=None):
         """Apply a validated provider quote inside the caller's write transaction."""
+        if not self.owns(row):
+            raise ValueError("position ownership cannot be verified")
+        self.verify_inventory(db, row)
         self.check_position_quote(row, quote, now)
         pid = row["id"]
-        if sell:
-            proceeds = quote.bid * row["quantity"] * row["contract_size"]
-            cash = self._account(db)["cash"] + proceeds
-            if cash > MAX_SQLITE_INT:
-                raise ValueError("simulated cash would exceed the ledger's integer range")
-            overdue = self.due(row, now)
-            late = max(0, (now - self.exit_deadline(row)) // timedelta(microseconds=1))
-            db.execute(
-                """UPDATE positions SET exit_price = ?, closed_at = ?, exit_reason = ?,
-                exit_late_us = ? WHERE id = ?""",
-                (quote.bid, now.isoformat(), "holding_limit" if overdue else "manual", late, pid),
-            )
-            db.execute("UPDATE account SET cash = ? WHERE id = 1", (cash,))
-            resolve(db, f"holding:{pid}", now)
+        if sale is not None:
+            self._fill_exit(db, row, quote, now, *sale)
         at = quote.quoted_at.isoformat()
-        if sell or row["last_quote"] is None or at != row["last_quote_at"]:
+        if sale is not None or row["last_quote"] is None or at != row["last_quote_at"]:
             db.execute(
                 "UPDATE positions SET last_bid = ?, last_quote_at = ?, last_quote = ? WHERE id = ?",
                 (quote.bid, at, json.dumps(quote.audit(now)), pid),
             )
+        stop = self._account(db)["stop_loss_bps"]
+        remaining = row["remaining"] - (sale[1] if sale else 0)
+        if remaining and (row["entry_price"] - quote.bid) * 10000 >= row["entry_price"] * stop:
+            incident(db, f"stop_loss:{pid}", "warning", "paper stop-loss threshold reached", now)
+        else:
+            resolve(db, f"stop_loss:{pid}", now)
         resolve(db, f"quote:{pid}", now)
+
+    def _fill_exit(self, db, row, quote, now, order_id, quantity, digest):
+        policy = self.require_policy()
+        limits = policy.limits
+        if db.execute("SELECT 1 FROM positions WHERE order_id = ?", (order_id,)).fetchone():
+            raise ValueError("order_id already used for a buy")
+        if not 0 < quantity <= row["remaining"]:
+            raise ValueError("sell quantity exceeds available bot-owned quantity")
+        proceeds = quote.bid * quantity * row["contract_size"]
+        if quantity > limits.max_sell_quantity or proceeds > limits.max_sell_value:
+            raise ValueError("sell quantity or order value limit exceeded")
+        if quote.bid < limits.min_sell_price:
+            raise ValueError("minimum sell price limit breached")
+        self.check_execution_clock(db, now)
+        cash = self._account(db)["cash"] + proceeds
+        if cash > MAX_SQLITE_INT:
+            raise ValueError("simulated cash would exceed the ledger's integer range")
+        pid = row["id"]
+        remaining = row["remaining"] - quantity
+        db.execute("INSERT INTO paper_exits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+            order_id, digest, pid, policy.bot_id, policy.strategy_id, quantity,
+            quote.bid, now.isoformat(), json.dumps(quote.audit(now)),
+        ))
+        db.execute("UPDATE paper_ownership SET remaining = ? WHERE position_id = ?", (remaining, pid))
+        db.execute("UPDATE account SET cash = ? WHERE id = 1", (cash,))
+        if remaining == 0:
+            late = max(0, (now - self.exit_deadline(row)) // timedelta(microseconds=1))
+            db.execute(
+                """UPDATE positions SET exit_price = ?, closed_at = ?, exit_reason = ?,
+                exit_late_us = ? WHERE id = ?""",
+                (quote.bid, now.isoformat(), "holding_limit" if self.due(row, now) else "manual", late, pid),
+            )
+            resolve(db, f"holding:{pid}", now)
+            resolve(db, f"failed_exit:{pid}", now)
+
+    def verify_inventory(self, db, row):
+        fills = db.execute(
+            "SELECT * FROM paper_exits WHERE position_id = ?", (row["id"],)
+        ).fetchall()
+        if (not row["bot_id"] or not row["strategy_id"] or not row["order_id"]
+                or not row["request_hash"] or not row["entry_quote"]
+                or row["remaining"] != row["quantity"] - sum(fill["quantity"] for fill in fills)
+                or any(self.fill_pnl(row, fill) is None for fill in fills)):
+            raise ValueError("bot-owned inventory evidence is inconsistent")
+
+    @staticmethod
+    def check_execution_clock(db, now):
+        times = db.execute("""
+            SELECT opened_at AS occurred_at FROM positions
+            UNION ALL SELECT closed_at FROM positions WHERE closed_at IS NOT NULL
+            UNION ALL SELECT filled_at FROM paper_exits
+        """)
+        if any(timestamp(row["occurred_at"]) > now for row in times):
+            raise ValueError("clock is older than recorded paper activity")
+
+    def daily_usage(self, db, now):
+        day = now.astimezone(TEHRAN).date()
+        purchased = 0
+        loss = 0
+        for row in db.execute(POSITION_ROWS):
+            opened = timestamp(row["opened_at"])
+            if opened > now:
+                raise ValueError("clock is older than recorded paper activity")
+            if opened.astimezone(TEHRAN).date() == day:
+                purchased += row["entry_price"] * row["quantity"] * row["contract_size"]
+            if row["bot_id"] is None and row["closed_at"]:
+                closed = timestamp(row["closed_at"])
+                if closed > now:
+                    raise ValueError("clock is older than recorded paper activity")
+                if closed.astimezone(TEHRAN).date() == day:
+                    pnl = self.realized_pnl(row)
+                    loss = None if pnl is None or loss is None else loss + max(0, -pnl)
+        for fill in db.execute("SELECT * FROM paper_exits"):
+            filled = timestamp(fill["filled_at"])
+            if filled > now:
+                raise ValueError("clock is older than recorded paper activity")
+            if filled.astimezone(TEHRAN).date() == day:
+                pnl = self.fill_pnl(self.position(db, fill["position_id"]), fill)
+                loss = None if pnl is None or loss is None else loss + max(0, -pnl)
+        return purchased, loss
 
     def status(self):
         with self.transaction(write=False) as db:
             now = timestamp(self.clock())
             account = self._account(db)
-            positions = [self._view(row, now, account["stop_loss_bps"]) for row in self._open(db)]
+            positions = [self._view(db, row, now, account["stop_loss_bps"]) for row in self._open(db)]
             allocated = sum(pos["purchase_cost"] for pos in positions)
             marks = [pos["unrealized_pnl"] for pos in positions]
-            realized = [self.realized_pnl(row) for row in db.execute(
-                "SELECT * FROM positions WHERE closed_at IS NOT NULL"
-            )]
+            rows = db.execute(POSITION_ROWS + " WHERE p.closed_at IS NOT NULL OR o.remaining < p.quantity")
+            realized = [self.position_pnl(db, row) for row in rows]
+            report = None
+            if self.policy is not None:
+                purchased, loss = self.daily_usage(db, now)
+                report = self.policy.report(purchased=purchased, loss=loss)
             return {
                 **dict(account),
                 "entries_paused": self._paused(db),
@@ -378,15 +559,14 @@ class PaperTrading:
                 "realized_pnl": None if None in realized else sum(realized),
                 "unrealized_pnl": None if None in marks else sum(marks),
                 "positions": positions,
+                "گزارش حدود و ظرفیت روزانه (ریال)": report,
             }
 
     def history(self):
         with self.transaction(write=False) as db:
             now = timestamp(self.clock())
             stop = self._account(db)["stop_loss_bps"]
-            return [self._view(row, now, stop) for row in db.execute(
-                "SELECT * FROM positions ORDER BY id"
-            )]
+            return [self._view(db, row, now, stop) for row in db.execute(POSITION_ROWS + " ORDER BY p.id")]
 
     @staticmethod
     def _account(db):
@@ -397,11 +577,37 @@ class PaperTrading:
 
     @staticmethod
     def _open(db):
-        return db.execute("SELECT * FROM positions WHERE closed_at IS NULL ORDER BY id").fetchall()
+        return db.execute(POSITION_ROWS + " WHERE p.closed_at IS NULL ORDER BY p.id").fetchall()
 
     @staticmethod
     def _cost(row):
-        return row["entry_price"] * row["quantity"] * row["contract_size"]
+        quantity = row["quantity"] if row["remaining"] is None else row["remaining"]
+        return row["entry_price"] * quantity * row["contract_size"]
+
+    def fill_pnl(self, row, fill):
+        if row is None or (fill["bot_id"], fill["strategy_id"]) != (row["bot_id"], row["strategy_id"]):
+            return None
+        fill_row = dict(row)
+        fill_row.update(closed_at=fill["filled_at"], exit_price=fill["price"],
+                        last_quote=fill["quote"], quantity=fill["quantity"])
+        try:
+            fill_row["last_quote_at"] = json.loads(fill["quote"])["quoted_at"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        return self.realized_pnl(fill_row)
+
+    def position_pnl(self, db, row):
+        if row["bot_id"] is None:
+            return self.realized_pnl(row)
+        fills = db.execute("SELECT * FROM paper_exits WHERE position_id = ? ORDER BY rowid", (row["id"],)).fetchall()
+        if not fills or sum(fill["quantity"] for fill in fills) != row["quantity"] - row["remaining"]:
+            return None
+        if row["closed_at"] and (row["exit_price"], row["closed_at"], row["last_quote"]) != (
+            fills[-1]["price"], fills[-1]["filled_at"], fills[-1]["quote"]
+        ):
+            return None
+        values = [self.fill_pnl(row, fill) for fill in fills]
+        return None if None in values else sum(values)
 
     def realized_pnl(self, row):
         """Report a historical fill only when its execution evidence can be checked."""
@@ -430,12 +636,13 @@ class PaperTrading:
             return None
         return (quote.bid - row["entry_price"]) * row["quantity"] * row["contract_size"]
 
-    def _view(self, row, now, stop_bps):
+    def _view(self, db, row, now, stop_bps):
         view = dict(row)
         view.pop("request_hash")
         for field in ("entry_quote", "last_quote"):
             view[field] = json.loads(row[field]) if row[field] else None
-        units = row["quantity"] * row["contract_size"]
+        remaining = row["quantity"] if row["remaining"] is None else row["remaining"]
+        units = remaining * row["contract_size"]
         closed = row["closed_at"] is not None
         overdue = not closed and self.due(row, now)
         if not closed:
@@ -452,7 +659,10 @@ class PaperTrading:
                     else "EXIT_PENDING" if overdue else "OPEN"),
             purchase_cost=cost,
             unrealized_pnl=pnl,
-            realized_pnl=self.realized_pnl(row),
+            realized_pnl=self.position_pnl(db, row),
+            exit_orders=[{key: fill[key] for key in ("order_id", "quantity", "price", "filled_at")}
+                         for fill in db.execute("SELECT * FROM paper_exits WHERE position_id = ? ORDER BY rowid",
+                                                (row["id"],))],
             stop_loss_alert=None if pnl is None else -pnl * 10000 >= cost * stop_bps,
         )
         return view

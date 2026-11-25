@@ -7,17 +7,99 @@ by default. Put `--db PATH` after `paper` to choose a different paper ledger.
 
 ```sh
 python trade_manager.py paper init --equity 10000000 --stop-bps 300
-python trade_manager.py paper --catalog catalog.json buy --calendar sessions.json --order-id order-001 --quantity 1 --quote quote.json
-python trade_manager.py paper --catalog catalog.json mark --position-id 1 --quote updated-quote.json
-python trade_manager.py paper --catalog catalog.json sell --position-id 1 --quote updated-quote.json
-python trade_manager.py paper --catalog catalog.json monitor --feed feed.json --interval 15
+python trade_manager.py paper --policy policy.json --catalog catalog.json buy --calendar sessions.json --order-id order-001 --quantity 1 --quote quote.json
+python trade_manager.py paper --policy policy.json --catalog catalog.json mark --position-id 1 --quote updated-quote.json
+python trade_manager.py paper --policy policy.json --catalog catalog.json sell --position-id 1 --order-id exit-001 --quantity 1 --quote updated-quote.json
+python trade_manager.py paper --policy policy.json --catalog catalog.json monitor --feed feed.json --interval 15
 python trade_manager.py paper monitor-status
 python trade_manager.py paper incidents
 python trade_manager.py paper pause
 python trade_manager.py paper resume
-python trade_manager.py paper status
+python trade_manager.py paper --policy policy.json status
 python trade_manager.py paper history
 ```
+
+## Bot ownership and hard limits
+
+Use a trusted local policy file with explicit positive integer limits. Example
+values below are illustrative. Prices are per option unit in whole rials.
+Order values include the quantity and contract multiplier.
+
+```json
+{
+  "bot_id": "research-bot",
+  "strategy_id": "paper-strategy",
+  "limits": {
+    "max_buy_quantity": 3,
+    "max_buy_value": 500000,
+    "max_buy_price": 500,
+    "max_daily_purchase_value": 1000000,
+    "max_open_exposure": 1000000,
+    "max_sell_quantity": 3,
+    "max_sell_value": 1000000,
+    "min_sell_price": 1,
+    "max_daily_loss": 100000
+  }
+}
+```
+
+Pass the policy to buy, mark, sell and monitor. The policy file and SQLite
+ledger are trusted operator inputs. An opening order permanently associates
+the position with its bot and strategy. Legacy positions without recorded
+ownership and positions owned by other strategies are left untouched. Their
+allocation still counts toward the account cap. Each exit requires a unique
+order ID and records its owner, position, quantity, bid and quote evidence in
+the same transaction as cash and remaining quantity. Exact retries cannot
+execute a second fill. Omit sell quantity to request the entire remainder.
+
+Daily limits apply across the ledger using Tehran dates. Sales never restore
+the daily purchase budget. The loss cap uses gross realized losses from
+evidenced fills, including partial exits. Reaching it or being unable to
+verify the day's losses blocks new entries. Emergency pause also blocks entry,
+and both leave risk-reducing exits subject to the sell limits. The existing
+10% account exposure cap still applies. The stop-loss threshold produces an
+alert. A required full exit blocked by sell limits or quote evidence stays
+pending with a critical alert. An operator may submit a partial exit within
+the configured limits before the trading cutoff.
+
+The Persian JSON report from `paper --policy policy.json status` shows the
+configured buy/sell limits and the remaining daily purchase and loss capacity.
+
+## Offline replay
+
+```sh
+python trade_manager.py paper --policy policy.json --catalog catalog.json replay \
+  --calendar sessions.json --equity 10000000 --events replay-events.json
+```
+
+Replay processes a JSON array in nondecreasing `at` timestamp order and uses
+a fresh disposable ledger. Each event has `at` and `action`. A `screen` event
+uses the shared shortlist rules, then submits a paper buy only when the
+candidate passes. Supply `quote`, `quantity`, `order_id`, and a `market` object
+with `observed_at` matching the quote time, `strike`,
+`underlying_closing_price`, `trade_count`, `trade_volume`, `bid_volume` and
+`ask_volume`. Strike and underlying price must use the same unit as the
+quote. The catalog's last trading date provides remaining days, and the
+CALL/PUT side determines intrinsic value. Screening is a research shortlist,
+and all ledger checks still apply to entry. An explicit `buy` supplies
+`quote`, `quantity` and `order_id`; a `sell` also supplies `position_id`
+(and may use null quantity for the full remainder). A `monitor` supplies a
+`quotes` array; `pause` and `resume` take no additional fields. The report
+contains the final state, simulated fills, screening decisions, alerts and
+rejected events. It separately reports actual evidence coverage from the
+versioned research registry. The registry currently lacks independently
+verified evidence for executable historical fills and official settlement.
+Provide only separately provenance-checked historical provider quotes.
+Archive receipt time alone does not establish an executable quote or
+settlement. Label disposable synthetic replays with
+`--input-class synthetic_fixture`. This label describes the data and does not
+relax any validation.
+
+The deterministic CLI lifecycle is exercised by
+`python -B -m unittest test_paper_trading.PaperTradingTests.test_deterministic_end_to_end_call_and_put_cli_lifecycle`.
+It screens and enters CALL and PUT positions, processes scripted partial exits
+and automatic deadline exits, and leaves an unresolved PUT awaiting official
+settlement.
 
 ## Input and trust boundary
 

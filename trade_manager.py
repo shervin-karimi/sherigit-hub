@@ -6,8 +6,10 @@ import sys
 from datetime import datetime, date
 from pathlib import Path
 
+from paper_limits import BotPolicy
 from paper_monitor import PaperMonitor
 from paper_quotes import load_catalog
+from paper_replay import replay
 from paper_trading import DB_PATH as PAPER_DB_PATH, PaperTrading
 from shadow_schedule import load_calendar
 
@@ -265,24 +267,29 @@ def close_trade(args):
 
 def run_paper(args):
     try:
-        quote_actions = ("buy", "mark", "sell", "monitor")
+        quote_actions = ("buy", "mark", "sell", "monitor", "replay")
         catalog = None
         if args.action in quote_actions and args.catalog is None:
             raise ValueError("--catalog is required for quote processing")
         if args.catalog is not None:
             catalog = load_catalog(json.loads(args.catalog.read_text(encoding="utf-8")))
-        sessions = load_calendar(args.calendar)[0] if args.action == "buy" and args.calendar else None
-        ledger = PaperTrading(args.db, catalog=catalog, sessions=sessions)
-        if args.action == "init":
+        sessions = load_calendar(args.calendar)[0] if args.action in ("buy", "replay") and args.calendar else None
+        policy = BotPolicy.parse(json.loads(args.policy.read_text(encoding="utf-8"))) if args.policy else None
+        ledger = PaperTrading(args.db, catalog=catalog, sessions=sessions, policy=policy)
+        if args.action == "replay":
+            result = replay(json.loads(args.events.read_text(encoding="utf-8")), equity=args.equity,
+                            catalog=catalog, sessions=sessions, policy=policy, input_class=args.input_class)
+        elif args.action == "init":
             ledger.initialize(args.equity, args.stop_bps)
             result = ledger.status()
         elif args.action in ("buy", "mark", "sell"):
             quote = json.loads(args.quote.read_text(encoding="utf-8"))
             if args.action == "buy":
                 result = ledger.buy(quote, args.quantity, order_id=args.order_id)
+            elif args.action == "mark":
+                result = ledger.mark(args.position_id, quote)
             else:
-                operation = ledger.mark if args.action == "mark" else ledger.sell
-                result = operation(args.position_id, quote)
+                result = ledger.sell(args.position_id, quote, order_id=args.order_id, quantity=args.quantity)
         elif args.action in ("status", "history"):
             result = ledger.status() if args.action == "status" else ledger.history()
         elif args.action in ("pause", "resume"):
@@ -307,6 +314,7 @@ def add_paper_commands(commands):
     paper = commands.add_parser("paper", help="معاملات آزمایشی آفلاین؛ بدون ارسال سفارش")
     paper.add_argument("--db", type=Path, default=PAPER_DB_PATH)
     paper.add_argument("--catalog", type=Path, help="فهرست محلی مشخصات تأییدشدهٔ قراردادها")
+    paper.add_argument("--policy", type=Path, help="پروندهٔ محلی شناسهٔ ربات، راهبرد و حدود معامله")
     actions = paper.add_subparsers(dest="action", required=True)
     init = actions.add_parser("init", help="راه‌اندازی حساب آزمایشی")
     init.add_argument("--equity", type=int, required=True, help="سرمایهٔ اولیه به ریال")
@@ -320,6 +328,9 @@ def add_paper_commands(commands):
             action.add_argument("--order-id", required=True, help="شناسهٔ یکتا برای جلوگیری از ثبت تکراری")
         else:
             action.add_argument("--position-id", type=int, required=True)
+            if name == "sell":
+                action.add_argument("--quantity", type=int, help="تعداد خروج جزئی")
+                action.add_argument("--order-id", required=True, help="شناسهٔ یکتای سفارش خروج")
     actions.add_parser("status", help="وجه نقد، تخصیص، سود و زیان و موقعیت‌های باز")
     actions.add_parser("history", help="تاریخچهٔ ورود و خروج آزمایشی")
     actions.add_parser("pause", help="توقف اضطراری خرید آزمایشی")
@@ -330,6 +341,12 @@ def add_paper_commands(commands):
     monitor.add_argument("--once", action="store_true")
     actions.add_parser("monitor-status", help="آخرین وضعیت و زمان ضربان ناظر")
     actions.add_parser("incidents", help="رخدادهای ثبت‌شده")
+    historical = actions.add_parser("replay", help="بازپخش آفلاین در دفتر موقت")
+    historical.add_argument("--events", type=Path, required=True)
+    historical.add_argument("--calendar", type=Path, required=True)
+    historical.add_argument("--equity", type=int, required=True)
+    historical.add_argument("--input-class", choices=("operator_supplied", "synthetic_fixture"),
+                            default="operator_supplied")
     paper.set_defaults(func=run_paper)
 
 
