@@ -39,6 +39,10 @@ TRANSIENT_ERRNOS = {
 }
 
 
+class DuplicateCapture(watch.ArchiveError):
+    """The fetched body is already sealed in an observation archive."""
+
+
 class CaptureSkipped(Exception):
     def __init__(self, reason, **fields):
         super().__init__(reason)
@@ -196,8 +200,8 @@ def append(root, fd, prior, raw, started, received, headers, *,
     seq = len(prior) + 1
     watch.require(seq <= 99_999_999 and len(raw) <= watch.MAX_BODY, "stream or body limit exceeded")
     body_hash = watch.digest(raw)
-    watch.require(body_hash not in blocked_hashes
-                  and all(row["body_sha256"] != body_hash for row in prior), "duplicate body SHA-256")
+    if body_hash in blocked_hashes or any(row["body_sha256"] == body_hash for row in prior):
+        raise DuplicateCapture("duplicate body SHA-256")
     watch.require(started.utcoffset() == received.utcoffset() == timedelta(0) and started <= received
                   and (not prior or started > utc(prior[-1]["receipt_utc"])),
                   "duplicate or out-of-order receipt/request clock")
