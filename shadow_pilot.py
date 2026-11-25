@@ -9,9 +9,10 @@ import sqlite3
 from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfoNotFoundError
 
+from market_data_quality import quote_shape
 from paper_limits import BotPolicy
 from paper_monitor import PaperMonitor
-from paper_quotes import TEHRAN, load_catalog, positive_int, timestamp
+from paper_quotes import MAX_QUOTE_AGE, TEHRAN, load_catalog, positive_int, timestamp
 from paper_replay import evidence_coverage, screen_candidate
 from paper_trading import PaperTrading, incident
 import shadow_collector as collector
@@ -65,6 +66,10 @@ def configuration(path):
 
 def private_directory(path):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    verify_private_directory(path)
+
+
+def verify_private_directory(path):
     info = path.lstat()
     watch.require(path.is_dir() and not path.is_symlink()
                   and info.st_uid == os.getuid() and not info.st_mode & 0o077,
@@ -122,8 +127,18 @@ def scan_day(stream, day):
         side = [row for row in rows.values() if row["option_type"] == kind]
         counts[kind] = {"قرارداد": len(side), "دوطرفه": sum(row["two_sided"] for row in side),
                         "نامزد": sum(row["candidate_eligible"] for row in side)}
+    contracts = {}
+    for code, row in rows.items():
+        shape, _ = quote_shape(*(row[key] or 0 for key in (*watch.PRICE_FIELDS, "bid_volume", "ask_volume")))
+        contracts[code] = {key: row[key] for key in (
+            "symbol", "underlying_symbol", "underlying_code", "option_type",
+            "best_bid", "best_ask", "bid_volume", "ask_volume", "spread_percent",
+            "trade_count", "remaining_days", "strike_price", "maturity_date", "contract_size",
+            "candidate_eligible", "candidate_rejection",
+        )} | {"quote_shape": shape}
     return {
         "تعداد ثبت روز": len(captures),
+        "قراردادها": contracts,
         "آخرین ثبت": {key: latest[key] for key in (
             "receipt_tehran", "body_sha256", "head_sha256", "exchange_quote_timestamp",
             "execution_eligible", "dataset_class")} if latest else None,
@@ -145,20 +160,31 @@ def position_report(ledger, quotes):
             continue
         quote = quotes.get(row["ins_code"])
         capacity = None
+        valid_until = None
         gap = None
         if row["status"] == "EXPIRY_REVIEW":
             capacity = 0
             gap = "مدرک رسمی تسویه برای این قرارداد موجود نیست"
         elif quote is None:
             gap = "مظنهٔ مستقل و معتبر برای این موقعیت در بستهٔ فعلی نیست"
+        elif not row["last_quote"] or (
+            timestamp(row["last_quote_at"]) != timestamp(quote["quoted_at"])
+            or row["last_quote"]["source"] != quote["source"]
+            or (row["last_quote"]["bid"], row["last_quote"]["ask"]) != (quote["best_bid"], quote["best_ask"])
+        ):
+            gap = "مظنهٔ بسته برای این موقعیت در دفتر تأیید نشده است"
         else:
             bid = quote["best_bid"]
+            valid_until = timestamp(quote["quoted_at"]) + MAX_QUOTE_AGE
+            if row["trade_cutoff_at"]:
+                valid_until = min(valid_until, timestamp(row["trade_cutoff_at"]))
             capacity = (min(row["remaining"], limits.max_sell_quantity,
                             limits.max_sell_value // (bid * row["contract_size"]))
                         if bid >= limits.min_sell_price else 0)
         positions.append({"شناسه": row["id"], "نماد": row["symbol"], "نوع": row["option_type"],
                           "وضعیت": row["status"], "تعداد باقی‌مانده": row["remaining"],
                           "هشدار حد ضرر": row["stop_loss_alert"], "ظرفیت فروش هر سفارش": capacity,
+                          "اعتبار ظرفیت تا UTC": valid_until.isoformat() if valid_until else None,
                           "شاهد لازم": gap})
     owned_history = [row for row in ledger.history() if ledger.owns(row)]
     own_ids = {str(row["id"]) for row in owned_history}
@@ -175,6 +201,9 @@ def position_report(ledger, quotes):
         "موقعیت‌های ربات": positions, "خروج‌های آزمایشی امروز": exits,
         "توقف ورود": account["entries_paused"],
         "حدود و ظرفیت خرید": account["گزارش حدود و ظرفیت روزانه (ریال)"],
+        "ظرفیت باقی‌ماندهٔ مواجهه": max(
+            0, min(account["allocation_limit"], limits.max_open_exposure) - account["allocated"]
+        ),
         "سقف فروش روزانه": None,
         "هشدارهای بحرانی دفتر": alerts,
     }
@@ -383,14 +412,14 @@ def tick_locked(root, sessions, windows, gap, paper, calendar_hash):
 
 def status(config):
     root, _, _, _, _ = configuration(config)
+    return status_for_root(root, collector.utc_now())
+
+
+def status_for_root(root, now):
     if not os.path.lexists(root):
         return {"وضعیت": "آغاز نشده"}
-    info = root.lstat()
-    watch.require(root.is_dir() and not root.is_symlink()
-                  and info.st_uid == os.getuid() and not info.st_mode & 0o077,
-                  "pilot directory must be private and owned by the pilot user")
+    verify_private_directory(root)
     state = load_state(root / "state.json")
-    now = collector.utc_now()
     finished = collector.utc(state["last_finished"]) if state["last_finished"] else None
     stale = finished is None or not timedelta(0) <= now - finished <= timedelta(minutes=3)
     return {"وضعیت": "گزارش قدیمی یا ناقص" if stale else state["result"], "سلامت": state}

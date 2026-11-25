@@ -42,6 +42,19 @@ def number(value, *, signed=False):
     return value, "zero" if value == 0 else "present"
 
 
+def quote_shape(bid, ask, bid_depth, ask_depth, *, invalid=False):
+    """Describe visible prices and depth without making an evidence claim."""
+    mismatched = [name for name, price, depth in (
+        ("bid", bid, bid_depth), ("ask", ask, ask_depth)
+    ) if bool(price) != bool(depth)]
+    if bid > ask > 0:
+        return "crossed", mismatched
+    if invalid or mismatched:
+        return "inconsistent", mismatched
+    return ("two_sided" if bid and ask else "bid_only" if bid
+            else "ask_only" if ask else "missing"), mismatched
+
+
 def inspect_contract(raw, side):
     """Inspect raw price/depth/spot/counter fields without relying on scanner verdicts."""
     fields = {key: raw.get(f"{source}_{side}") for key, source in SIDE_FIELDS.items()}
@@ -53,16 +66,8 @@ def inspect_contract(raw, side):
     bid, ask, bd, ad, trades, volume = (observed[key] or 0 for key in SIDE_FIELDS)
     ordered = bid > 0 and ask >= bid
     spread = (ask - bid) / ((ask + bid) / 2) * 100 if ordered else None
-    mismatched = [name for name, price, depth in (("bid", bid, bd), ("ask", ask, ad))
-                  if bool(price) != bool(depth)]
-    bad_quote_fields = [key for key in ("best_bid", "best_ask", "bid_volume", "ask_volume")
-                        if status[key] == "invalid"]
-    if bid > ask > 0:
-        quote = "crossed"
-    elif bad_quote_fields or mismatched:
-        quote = "inconsistent"
-    else:
-        quote = "two_sided" if ordered else "bid_only" if bid else "ask_only" if ask else "missing"
+    invalid = any(status[key] == "invalid" for key in ("best_bid", "best_ask", "bid_volume", "ask_volume"))
+    quote, mismatched = quote_shape(bid, ask, bd, ad, invalid=invalid)
     liquidity = []
     if not bd:
         liquidity.append("no_positive_bid_depth")

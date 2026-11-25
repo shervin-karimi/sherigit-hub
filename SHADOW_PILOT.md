@@ -106,3 +106,33 @@ and ledger; review its audit history before moving it or rotating trust.
 The deterministic tests use temporary ledgers and synthetic HTTP responses.
 They do not validate production market coverage, source authenticity, an
 official trading calendar or settlement documents.
+
+## Persian operational dashboard
+
+Run the dashboard as the same dedicated account that writes the pilot reports.
+The dashboard reads atomically published JSON files and scheduler state,
+binds to loopback, and serves only GET and HEAD. It has no collector,
+ledger-write or approval endpoint. Refresh the browser to read the latest
+published report. The date, symbol, contract side and screening filters
+work without JavaScript. Receipt time is shown separately from unverified
+exchange time. The report may show the remaining purchase budget for a
+historical date, while an expired sell-capacity estimate is shown as unknown.
+
+Reports produced before this milestone lack the contract table. Let the
+updated pilot complete a tick to publish today's compatible report. Keep
+historical reports in private storage. The dashboard does not rewrite them
+or read raw archive bodies to reconstruct them.
+
+```sh
+install -m 644 deploy/shadow-pilot-dashboard.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shadow-pilot-dashboard.service
+systemctl --user status shadow-pilot-dashboard.service
+```
+
+From the operator's workstation, run `ssh -N -L 8766:127.0.0.1:8766 pilot@VPS`
+and open `http://127.0.0.1:8766/`. Keep the same local and remote port so
+the strict Host check matches. If the checkout lives elsewhere, adjust
+`WorkingDirectory` and `ExecStart` in the unit. To stop the dashboard, run
+`systemctl --user disable --now shadow-pilot-dashboard.service`. The pilot
+timer continues independently.

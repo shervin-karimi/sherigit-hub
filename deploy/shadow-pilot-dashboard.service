@@ -1,0 +1,13 @@
+[Unit]
+Description=Read-only TSETMC shadow pilot dashboard
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sherigit-hub
+ExecStart=/usr/bin/python3 -B /opt/sherigit-hub/shadow_pilot_dashboard.py --config %h/.config/sherigit-pilot/config.json
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

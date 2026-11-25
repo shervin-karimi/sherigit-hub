@@ -34,7 +34,9 @@ class PilotTests(unittest.TestCase):
                 "2026-11-21", "2026-11-22", "2026-11-29", "2026-12-06", "2026-12-22"]
         self.write(self.calendar, {"source": "synthetic calendar",
                                    "sessions": {day: ["09:00-12:30"] for day in days}})
-        self.use_patch("socket.socket", side_effect=AssertionError("network forbidden"))
+        self.socket_guard = patch("socket.socket", side_effect=AssertionError("network forbidden"))
+        self.addCleanup(self.socket_guard.stop)
+        self.socket_guard.start()
         self.use_patch("shadow_collector.utc_now", side_effect=lambda: self.now)
         self.use_patch("shadow_watch.DEFAULT_ARCHIVE", new=self.root / "no-legacy")
         self.use_patch("shadow_collector.append", side_effect=lambda *a, **kw:

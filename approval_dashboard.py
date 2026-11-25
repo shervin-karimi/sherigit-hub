@@ -140,7 +140,8 @@ def summary_cards(report):
     return result
 
 
-def page(title, inner):
+def page(title, inner, *, banner="فقط پژوهش کاغذی — بدون سفارش، پرشدن یا تغییر دفتر معاملات.",
+         extra_style=""):
     return f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{h(title)} | TSE/IFB</title>
@@ -187,8 +188,9 @@ def page(title, inner):
  @media (min-width:64rem) and (orientation:landscape){{
    .candidate-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}
  }}
+{extra_style}
 </style></head><body><main><h1>{h(title)}</h1>
-<p><strong>فقط پژوهش کاغذی — بدون سفارش، پرشدن یا تغییر دفتر معاملات.</strong></p>
+<p><strong>{h(banner)}</strong></p>
 {inner}</main></body></html>""".encode("utf-8")
 
 
