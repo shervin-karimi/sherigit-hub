@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from itertools import count
 from pathlib import Path
 from unittest.mock import patch
@@ -30,14 +30,17 @@ class PaperTradingTests(unittest.TestCase):
             "ins_code": code, "symbol": "نماد نمونه", "option_type": kind,
             "contract_size": 10, "source": "test-provider",
             "expires_at": (self.now + timedelta(days=30)).isoformat(),
+            "first_trading_date": "2026-11-15",
+            "last_trading_date": "2026-12-21",
         } for code, kind in (("101", "CALL"), ("202", "PUT"))]
+        self.sessions = {f"2026-11-{day}": [(time(9), time(10))] for day in (15, 16, 17, 18, 21)}
         self.catalog = load_catalog(self.contracts)
         self.ledger = self.reopen()
         self.ledger.initialize(100_000)
         self.ids = count()
 
     def reopen(self):
-        return PaperTrading(self.path, clock=lambda: self.now, catalog=self.catalog)
+        return PaperTrading(self.path, clock=lambda: self.now, catalog=self.catalog, sessions=self.sessions)
 
     def buy(self, quote, quantity):
         return self.ledger.buy(quote, quantity, order_id=f"test-{next(self.ids)}")
@@ -165,7 +168,7 @@ class PaperTradingTests(unittest.TestCase):
         self.assertIsNone(status["positions"][0]["stop_loss_alert"])
 
         custom = PaperTrading(self.path.with_name("other.db"), clock=lambda: self.now,
-                              catalog=self.catalog)
+                              catalog=self.catalog, sessions=self.sessions)
         custom.initialize(100_000, stop_loss_bps=100)
         self.assertTrue(custom.buy(self.quote(), 1, order_id="custom")["stop_loss_alert"])
         self.assertEqual(custom.status()["stop_loss_bps"], 100)
@@ -194,17 +197,78 @@ class PaperTradingTests(unittest.TestCase):
         self.assertEqual(self.ledger.status()["allocated"], 0)
         self.assertEqual(self.ledger.status()["realized_pnl"], -100)
 
+    def test_entry_waits_for_fifth_session_close_in_tehran(self):
+        self.sessions["2026-11-21"] = [(time(9), time(9, 15)), (time(9, 30), time(10))]
+        self.now = self.now.replace(hour=6, minute=29, second=59)
+        with self.assertRaisesRegex(ValueError, "five trading sessions"):
+            self.buy(self.quote(), 1)
+        self.now += timedelta(seconds=1)
+        with self.assertRaisesRegex(ValueError, "five trading sessions"):
+            self.buy(self.quote(quoted_at=(self.now - timedelta(seconds=1)).isoformat()), 1)
+        self.assertEqual(self.buy(self.quote(), 1)["status"], "OPEN")
+
+    def test_entry_requires_calendar_and_verified_trading_dates(self):
+        for field in ("first_trading_date", "last_trading_date"):
+            with self.subTest(field=field):
+                contract = self.contracts[0].copy()
+                del contract[field]
+                self.catalog = load_catalog([contract])
+                self.ledger = self.reopen()
+                with self.assertRaisesRegex(ValueError, "session calendar"):
+                    self.buy(self.quote(), 1)
+        self.catalog = load_catalog(self.contracts)
+        self.ledger = PaperTrading(self.path, clock=lambda: self.now, catalog=self.catalog)
+        with self.assertRaisesRegex(ValueError, "session calendar"):
+            self.buy(self.quote(), 1)
+
+    def test_earlier_tehran_deadline_waits_for_valid_bid(self):
+        self.contracts[0]["last_trading_date"] = "2026-12-04"
+        self.catalog = load_catalog(self.contracts)
+        self.ledger = self.reopen()
+        pos = self.buy(self.quote(), 1)
+        deadline = datetime(2026, 11, 23, 20, 30, tzinfo=timezone.utc)
+        self.assertEqual(pos["exit_due_at"], deadline.isoformat())
+        monitor = PaperMonitor(self.ledger)
+        self.now = deadline - timedelta(seconds=1)
+        monitor.cycle([self.quote()])
+        self.assertEqual(self.ledger.history()[0]["status"], "OPEN")
+        self.now = deadline
+        monitor.cycle([self.quote(best_bid=0)])
+        self.assertEqual(self.ledger.history()[0]["status"], "EXIT_PENDING")
+        self.assertEqual(self.ledger.status()["allocated"], 1000)
+        monitor.cycle([self.quote(best_bid=90)])
+        self.assertEqual(self.ledger.history()[0]["exit_price"], 90)
+        with self.assertRaisesRegex(ValueError, "entry cutoff"):
+            self.buy(self.quote(), 1)
+
+    def test_existing_position_deadline_can_only_be_tightened(self):
+        self.buy(self.quote(), 1)
+        self.contracts[0]["last_trading_date"] = "2026-12-04"
+        self.catalog = load_catalog(self.contracts)
+        ledger = self.reopen()
+        self.now = datetime(2026, 11, 23, 20, 30, tzinfo=timezone.utc)
+        PaperMonitor(ledger).cycle(None)
+        without_catalog = PaperTrading(self.path, clock=lambda: self.now)
+        self.assertEqual(without_catalog.history()[0]["status"], "EXIT_PENDING")
+        self.assertEqual(without_catalog.history()[0]["exit_due_at"], self.now.isoformat())
+
     def test_cli_uses_local_quote_and_nonzero_error_status(self):
         quote_file = self.path.with_name("quote.json")
         catalog_file = self.path.with_name("catalog.json")
         quote_file.write_text(json.dumps(self.quote()), encoding="utf-8")
         catalog_file.write_text(json.dumps(self.contracts), encoding="utf-8")
+        calendar_file = self.path.with_name("sessions.json")
+        calendar_file.write_text(json.dumps({
+            "source": "test calendar",
+            "sessions": {day: ["09:00-10:00"] for day in self.sessions},
+        }), encoding="utf-8")
         command = ["paper", "--db", str(self.path), "--catalog", str(catalog_file),
-                   "buy", "--quantity", "1", "--quote", str(quote_file), "--order-id", "cli"]
-        with patch("trade_manager.PaperTrading", return_value=self.ledger):
+                   "buy", "--calendar", str(calendar_file), "--quantity", "1", "--quote", str(quote_file), "--order-id", "cli"]
+        with patch("trade_manager.PaperTrading", return_value=self.ledger) as build:
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(main(command), 0)
             self.assertEqual(json.loads(out.getvalue())["status"], "OPEN")
+            build.assert_called_once_with(self.path, catalog=self.catalog, sessions=self.sessions)
             self.now += timedelta(minutes=6)
             command[-1] = "cli-new"
             with redirect_stderr(io.StringIO()) as err:
@@ -287,11 +351,8 @@ class PaperTradingTests(unittest.TestCase):
         self.assertEqual(self.ledger.history()[0]["status"], "EXIT_PENDING")
 
     def test_expiry_is_not_a_sale_or_a_zero_valuation(self):
-        self.contracts[0]["expires_at"] = (self.now + timedelta(days=2)).isoformat()
-        self.catalog = load_catalog(self.contracts)
-        self.ledger = self.reopen()
         pos = self.buy(self.quote(), 1)
-        self.now += timedelta(days=2)
+        self.now += timedelta(days=30)
         monitor = PaperMonitor(self.ledger)
         monitor.cycle([self.quote()])
         summary = self.ledger.status()
@@ -304,6 +365,91 @@ class PaperTradingTests(unittest.TestCase):
             self.ledger.sell(pos["id"], self.quote())
         with self.assertRaisesRegex(ValueError, "expired"):
             self.buy(self.quote(ins_code="202", option_type="PUT"), 1)
+
+    def test_final_tehran_date_boundary_blocks_manual_and_monitor_fills(self):
+        self.contracts[0]["last_trading_date"] = "2026-12-04"
+        self.catalog = load_catalog(self.contracts)
+        self.ledger = self.reopen()
+        pos = self.buy(self.quote(), 1)
+        monitor = PaperMonitor(self.ledger)
+        self.now = datetime(2026, 12, 4, 20, 29, 59, tzinfo=timezone.utc)
+        monitor.cycle([self.quote(quote_class="synthetic"), self.quote(best_bid=0)])
+        before = self.ledger.history()[0]
+        self.assertEqual(before["status"], "EXIT_PENDING")
+        self.assertIsNone(before["realized_pnl"])
+
+        cutoff = self.now + timedelta(seconds=1)
+        self.now = cutoff
+        self.assertEqual(self.ledger.history()[0]["status"], "EXPIRY_REVIEW")
+        previous_quote = self.quote(quoted_at=(cutoff - timedelta(seconds=1)).isoformat())
+        with self.assertRaisesRegex(ValueError, "official settlement"):
+            self.ledger.sell(pos["id"], previous_quote)
+        monitor.cycle([previous_quote, self.quote()])
+        position, = self.reopen().history()
+        self.assertEqual(position["status"], "EXPIRY_REVIEW")
+        self.assertEqual(position["expiry_seen_at"], cutoff.isoformat())
+        self.assertEqual(position["last_quote"], before["last_quote"])
+        for field in ("closed_at", "exit_price", "exit_reason", "realized_pnl", "unrealized_pnl"):
+            self.assertIsNone(position[field])
+        summary = self.ledger.status()
+        self.assertEqual((summary["cash"], summary["allocated"], summary["realized_pnl"]), (99_000, 1000, 0))
+
+        # A later catalog date and a clock rollback cannot reopen a settlement case.
+        self.catalog = load_catalog([dict(self.contracts[0], last_trading_date="2026-12-21")])
+        self.now -= timedelta(seconds=1)
+        restarted = self.reopen()
+        PaperMonitor(restarted).cycle([self.quote()])
+        self.assertEqual(restarted.history()[0]["status"], "EXPIRY_REVIEW")
+
+    def test_valid_quote_on_final_date_can_close_before_cutoff(self):
+        self.contracts[0]["last_trading_date"] = "2026-12-04"
+        self.catalog = load_catalog(self.contracts)
+        self.ledger = self.reopen()
+        self.buy(self.quote(), 1)
+        self.now = datetime(2026, 12, 4, 8, tzinfo=timezone.utc)
+        PaperMonitor(self.ledger).cycle([self.quote(best_bid=105, best_ask=106)])
+        restarted = PaperTrading(self.path, clock=lambda: self.now)
+        position, = restarted.history()
+        self.assertEqual((position["status"], position["realized_pnl"]), ("CLOSED", 50))
+
+    def test_legacy_position_without_verified_final_date_stays_pending(self):
+        pos = self.buy(self.quote(), 1)
+        # Emulate the schema at ebab9fb.
+        with self.ledger.transaction() as db:
+            db.execute("ALTER TABLE positions DROP COLUMN trade_cutoff_at")
+        contract = self.contracts[0].copy()
+        del contract["last_trading_date"]
+        self.catalog = load_catalog([contract])
+        self.now += timedelta(days=7)
+        restarted = self.reopen()
+        self.assertEqual(restarted.history()[0]["status"], "EXIT_PENDING")
+        with self.assertRaisesRegex(ValueError, "final trading date"):
+            restarted.sell(pos["id"], self.quote())
+        PaperMonitor(restarted).cycle([self.quote()])
+        position, = restarted.history()
+        self.assertIsNone(position["exit_price"])
+        self.assertIsNone(position["realized_pnl"])
+        self.assertIsNotNone(position["exit_pending_at"])
+
+    def test_legacy_closed_rows_without_executable_evidence_hide_realized_pnl(self):
+        pos = self.buy(self.quote(), 1)
+        self.now += timedelta(days=7)
+        closed = self.ledger.sell(pos["id"], self.quote(best_bid=90))
+        self.assertEqual(closed["realized_pnl"], -100)
+        for changes in (
+            {"last_quote": None},
+            {"last_quote": json.dumps(dict(closed["last_quote"], quote_class="synthetic"))},
+            {"trade_cutoff_at": closed["closed_at"]},
+        ):
+            with self.subTest(changes=changes):
+                with self.ledger.transaction() as db:
+                    db.execute("UPDATE positions SET last_quote = ?, trade_cutoff_at = ?",
+                               (json.dumps(closed["last_quote"]), closed["trade_cutoff_at"]))
+                    db.execute("UPDATE positions SET " + ", ".join(f"{key} = ?" for key in changes),
+                               tuple(changes.values()))
+                self.assertIsNone(self.ledger.history()[0]["realized_pnl"])
+                self.assertIsNone(self.ledger.status()["realized_pnl"])
+                self.assertEqual(self.ledger.status()["cash"], 99_900)
 
     def test_emergency_pause_persists_and_does_not_block_exit(self):
         pos = self.buy(self.quote(), 1)

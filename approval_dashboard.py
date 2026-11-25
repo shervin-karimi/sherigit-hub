@@ -406,6 +406,16 @@ def combined_value(value, *, suffix=""):
     return ltr("UNKNOWN") if value is None else shown(value, suffix=suffix)
 
 
+QUOTE_QUALITY = {
+    "two_sided": "دوطرفه",
+    "bid_only": "فقط خرید",
+    "ask_only": "فقط فروش",
+    "missing": "فاقد مظنه",
+    "crossed": "قیمت خرید بالاتر از فروش",
+    "inconsistent": "قیمت یا عمق ناسازگار",
+}
+
+
 def combined_option_card(row, *, technical_context=""):
     screen = row.get("screening") or {}
     rejection, rank_rejection = screen.get("candidate_rejection"), screen.get("rank_rejection")
@@ -443,11 +453,14 @@ def combined_option_card(row, *, technical_context=""):
         ("تاریخ سررسید گزارش‌شده", display_date(expiry) if expiry else ltr("UNKNOWN")),
     ])
     status = row["status"]
+    quality = QUOTE_QUALITY.get(row.get("quote_class"), "نامعلوم")
     return ('<article class="candidate-card combined-option"><header class="candidate-title">'
             f'<h3>{combined_value(row.get("symbol"))}</h3>{ltr(row["option_type"])}{raw(row["ins_code"])}'
             f'<span>پایه: {combined_value(row.get("underlying_symbol"))} {raw(row["underlying_code"])}</span></header>'
             f'<p><strong>{h(research.COMBINED_STATUSES.get(status, "نامعلوم"))}</strong> · {ltr(status)} — '
             f'{h(row["reason_fa"])} {raw(row["reason_code"])}</p>{quotes}'
+            f'<p>کیفیت مظنهٔ مشاهده‌شده: {h(quality)}<br>'
+            'اعتبار زمانی مظنه: نامعلوم؛ زمان بورس تأیید نشده است.</p>'
             f'<p>غربال اولیه: {h(screening)}<br>رتبه‌بندی سخت‌گیرانه: {h(rank)}</p>'
             f'<details><summary>جزئیات فنی مشاهده</summary><div class="record-details">{details}</div></details>'
             f'{technical_context}</article>')

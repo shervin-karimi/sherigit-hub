@@ -7,7 +7,7 @@ by default. Put `--db PATH` after `paper` to choose a different paper ledger.
 
 ```sh
 python trade_manager.py paper init --equity 10000000 --stop-bps 300
-python trade_manager.py paper --catalog catalog.json buy --order-id order-001 --quantity 1 --quote quote.json
+python trade_manager.py paper --catalog catalog.json buy --calendar sessions.json --order-id order-001 --quantity 1 --quote quote.json
 python trade_manager.py paper --catalog catalog.json mark --position-id 1 --quote updated-quote.json
 python trade_manager.py paper --catalog catalog.json sell --position-id 1 --quote updated-quote.json
 python trade_manager.py paper --catalog catalog.json monitor --feed feed.json --interval 15
@@ -29,6 +29,17 @@ permitted, with UTC offset). Do not infer the cutoff from a date alone. Use the
 same catalog for CLI and monitoring; restart the monitor after authorized
 changes. A held position's verified cutoff cannot be changed by editing the
 catalog file.
+
+For new purchases add verified `first_trading_date` and `last_trading_date`
+(Tehran dates in `YYYY-MM-DD`) to each contract. Use `buy --calendar sessions.json`
+with the same dated calendar format as `shadow_schedule.py`. The calendar has
+a nonempty `source` and a `sessions` object mapping each actual session date to
+one or more Tehran-time intervals, such as `["09:00-12:30"]`. Include the
+contract's first session and the actual sessions after it, omitting holidays
+and cancellations. The quote must be from at or after the close of the fifth
+listed session, counting the first. A date with multiple intervals counts once
+and completes at its final close. Purchases are blocked when this evidence is
+missing or the exit cutoff has already arrived.
 
 Supply one local JSON object for a manual CLI operation, or a JSON array of
 the same objects for the monitor's feed:
@@ -72,7 +83,11 @@ Have the producer replace snapshots atomically. Do not treat the `source` or
   It does not trigger a sale. Stale marks report unknown unrealized P&L and
   alert status (`null`), not zero. Old ledger marks without provenance are
   also unknown until refreshed; historical entries are preserved, not verified.
-- Deadline = fill timestamp + seven calendar days in UTC, including weekends.
+- The exit deadline is the earlier of seven calendar days after the fill
+  (UTC) and midnight at the start of the Tehran date ten calendar days before
+  the verified last trading date. Existing open positions keep their previous
+  deadline unless a matching catalog record supplies an earlier deadline,
+  which the ledger records when it observes the position.
   At or after it, new purchases are blocked even if the monitor is stopped.
   The monitor records the exit request and a critical incident, and uses the
   newest valid bid available for that instrument; contradictory prices at the
@@ -83,12 +98,21 @@ Have the producer replace snapshots atomically. Do not treat the `source` or
   backdated. `mark` alone never closes a position; explicit `sell` remains
   available with a valid quote. `pause` persists across restarts and blocks new
   entries only.
-- Expiry and holding time are distinct. An expired open contract becomes
-  `EXPIRY_REVIEW`, blocks entries, and keeps its capital reserved. It is not
-  valued at zero, sold, or settled by this engine. Verified settlement rules
-  and a separate reconciliation workflow are required; do not edit the
-  database to clear it. No fees, tax, depth/partial fills or market-hours
-  checks are modeled. All P&L is gross.
+- Trading eligibility ends at the earlier of the verified `expires_at`
+  cutoff and the start of the Tehran date after `last_trading_date`. An open
+  position then becomes `EXPIRY_REVIEW` (awaiting official settlement evidence)
+  and keeps its capital reserved. A replayed quote, including one observed before
+  the deadline, cannot book or backdate an exit after trading has ended. The
+  cutoff and the observed settlement state persist across restarts. If a legacy
+  position has no verified final trading date, the engine blocks quote-based
+  exits and retains it as `EXIT_PENDING` once its holding deadline is reached.
+- Historical realized P&L requires a stored, executable provider quote with
+  matching price and timestamps before the verified cutoff. The ledger reports
+  unknown realized P&L for historical closes without that evidence and leaves
+  recorded cash and history intact for reconciliation. This engine has no
+  settlement-evidence ingestion path. Official settlement requires a separate
+  reconciliation workflow. Execution does not model fees, tax, order-book
+  depth, partial fills or intraday market hours beyond a verified cutoff.
 - One foreground monitor per local database. `--once` processes one cycle
   and exits. A successful cycle commits position changes, deduplicated
   incidents, and heartbeat together. `monitor-status` reports `unresponsive`

@@ -9,6 +9,7 @@ from pathlib import Path
 from paper_monitor import PaperMonitor
 from paper_quotes import load_catalog
 from paper_trading import DB_PATH as PAPER_DB_PATH, PaperTrading
+from shadow_schedule import load_calendar
 
 DB_PATH = "data/trading.db"
 
@@ -266,11 +267,12 @@ def run_paper(args):
     try:
         quote_actions = ("buy", "mark", "sell", "monitor")
         catalog = None
-        if args.action in quote_actions:
-            if args.catalog is None:
-                raise ValueError("--catalog is required for quote processing")
+        if args.action in quote_actions and args.catalog is None:
+            raise ValueError("--catalog is required for quote processing")
+        if args.catalog is not None:
             catalog = load_catalog(json.loads(args.catalog.read_text(encoding="utf-8")))
-        ledger = PaperTrading(args.db, catalog=catalog)
+        sessions = load_calendar(args.calendar)[0] if args.action == "buy" and args.calendar else None
+        ledger = PaperTrading(args.db, catalog=catalog, sessions=sessions)
         if args.action == "init":
             ledger.initialize(args.equity, args.stop_bps)
             result = ledger.status()
@@ -313,6 +315,7 @@ def add_paper_commands(commands):
         action = actions.add_parser(name)
         action.add_argument("--quote", type=Path, required=True, help="فایل محلی مظنه (JSON)")
         if name == "buy":
+            action.add_argument("--calendar", type=Path, help="تقویم محلی جلسات معاملاتی تهران")
             action.add_argument("--quantity", type=int, required=True)
             action.add_argument("--order-id", required=True, help="شناسهٔ یکتا برای جلوگیری از ثبت تکراری")
         else:

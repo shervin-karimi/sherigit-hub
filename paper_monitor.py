@@ -90,7 +90,6 @@ class PaperMonitor:
                     incident(db, f"quote:{pid}", "warning", "quote missing, stale or unsafe", now)
                     continue
                 try:
-                    ledger.check_position_quote(row, quote, now)
                     ledger.apply_quote(db, row, quote, now, sell=(blocked == "overdue"))
                     resolve(db, f"processing:{pid}", now)
                 except ValueError as error:

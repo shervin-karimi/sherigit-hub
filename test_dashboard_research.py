@@ -531,6 +531,8 @@ class CombinedResearchHTTPTests(CombinedCacheFixture):
                      "risk.max_quantity=UNKNOWN", "اختیار یکتا<strong>", "۴۶", "۲۳", "RESEARCH_ONLY", "REJECTED",
                      "UNKNOWN", "فقط پژوهش؛ نه سیگنال", "غربال اولیه: عبور از غربال",
                      "رتبه‌بندی سخت‌گیرانه: رد در رتبه‌بندی", "&lt;rank&gt;", "&lt;script&gt;", "wide_spread",
+                     "کیفیت مظنهٔ مشاهده‌شده: دوطرفه",
+                     "اعتبار زمانی مظنه: نامعلوم؛ زمان بورس تأیید نشده است.",
                      "رد در غربال", "سمت خام", "missing_option_id"):
             self.assertIn(text, html)
         self.assertEqual(self.ids(html), [str(i) for i in range(90000, 90020)])
