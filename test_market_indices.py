@@ -3,50 +3,55 @@ import urllib.request
 
 URL = "https://cdn.tsetmc.com/api/Index/GetIndexB1LastAll/All/1"
 
-request = urllib.request.Request(
-    URL,
-    headers={
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-    }
-)
+def main():
+    request = urllib.request.Request(
+        URL,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
+    )
 
-try:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
 
-    rows = data.get("indexB1", [])
+        rows = data.get("indexB1", [])
 
-    targets = {
-        "32097828799138957": "شاخص کل",
-        "67130298613737946": "شاخص کل هم‌وزن",
-    }
+        targets = {
+            "32097828799138957": "شاخص کل",
+            "67130298613737946": "شاخص کل هم‌وزن",
+        }
 
-    print("نتیجهٔ دریافت اطلاعات شاخص‌ها")
-    print("=" * 40)
+        print("نتیجهٔ دریافت اطلاعات شاخص‌ها")
+        print("=" * 40)
 
-    found = set()
+        found = set()
 
-    for row in rows:
-        code = str(row.get("insCode"))
+        for row in rows:
+            code = str(row.get("insCode"))
 
-        if code not in targets:
-            continue
+            if code not in targets:
+                continue
 
-        found.add(code)
+            found.add(code)
 
-        name = targets[code]
-        value = row.get("xDrNivJIdx004")
-        change = row.get("xVarIdxJRfV")
+            name = targets[code]
+            value = row.get("xDrNivJIdx004")
+            change = row.get("xVarIdxJRfV")
 
-        print("نام:", name)
-        print("مقدار شاخص:", value)
-        print("درصد تغییر:", change)
-        print("-" * 40)
+            print("نام:", name)
+            print("مقدار شاخص:", value)
+            print("درصد تغییر:", change)
+            print("-" * 40)
 
-    for code, name in targets.items():
-        if code not in found:
-            print("اطلاعات پیدا نشد:", name)
+        for code, name in targets.items():
+            if code not in found:
+                print("اطلاعات پیدا نشد:", name)
 
-except Exception as error:
-    print("خطا در دریافت اطلاعات:", str(error))
+    except Exception as error:
+        print("خطا در دریافت اطلاعات:", str(error))
+
+
+if __name__ == "__main__":
+    main()

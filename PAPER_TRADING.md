@@ -211,3 +211,20 @@ Have the producer replace snapshots atomically. Do not treat the `source` or
   reliable hosting, a verified feed and a separate watchdog.
 
 Offline tests: `python -B -m unittest -v test_paper_trading`
+
+## Repeatable offline tests
+
+CI uses Python 3.12 and the pinned packages in `requirements-test.txt`.
+The test runner installs the network and data-write guards before pytest
+discovery. Loopback HTTP is allowed for local dashboard tests. Replay
+subprocesses run with the same guards.
+
+```sh
+python -m pip install -r requirements-test.txt
+python -B run_offline_tests.py
+```
+
+The three TSETMC diagnostic scripts run their requests only when executed
+directly. Test discovery imports them without contacting TSETMC. The
+sensitivity test uses in-memory data. Run `sensitivity_test.py PATH` only
+when intentionally analyzing a separately generated research file.

@@ -8,31 +8,36 @@ headers = {
     "Accept": "application/json"
 }
 
-try:
-    req = urllib.request.Request(
-        url,
-        headers=headers
-    )
-
-    with urllib.request.urlopen(req, timeout=20) as response:
-
-        print("HTTP Status:", response.status)
-
-        raw_data = response.read().decode("utf-8")
-
-        data = json.loads(raw_data)
-
-        print("\nConnection successful!")
-
-        print("\nFirst response:")
-
-        print(
-            json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2
-            )[:3000]
+def main():
+    try:
+        req = urllib.request.Request(
+            url,
+            headers=headers
         )
 
-except Exception as e:
-    print("ERROR:", repr(e))
+        with urllib.request.urlopen(req, timeout=20) as response:
+
+            print("HTTP Status:", response.status)
+
+            raw_data = response.read().decode("utf-8")
+
+            data = json.loads(raw_data)
+
+            print("\nConnection successful!")
+
+            print("\nFirst response:")
+
+            print(
+                json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    indent=2
+                )[:3000]
+            )
+
+    except Exception as e:
+        print("ERROR:", repr(e))
+
+
+if __name__ == "__main__":
+    main()

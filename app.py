@@ -129,24 +129,42 @@ return 'قیمت فروش هدف با سود خالص ۱۰٪: '+fmt(targetBid/10
 +' | قیمت فروش در حد زیان ۳٪: '+fmt(stopBid/10)+' تومان'
 +' (هر دو تخمینی و بر اساس Bid، با فرض کارمزد درصدی و لغزش واردشده؛ حد ضرر تضمین زیان حداکثر ۳٪ نیست.)';
 }
+function element(tag,className,text){
+const node=document.createElement(tag);
+if(className)node.className=className;
+if(text!==undefined)node.textContent=text;
+return node;
+}
 function card(x){
-return `<div class="card" data-target-key="${x.type}:${x.symbol}">
-<h3>${x.symbol} <span class="tag">${x.type}</span></h3>
-<div class="grid">
-<div class="cell">روز تا سررسید<br><b>${fmt(x.days)}</b></div>
-<div class="cell">قیمت سهم پایه<br><b>${fmt(x.spot/10)} تومان</b></div>
-<div class="cell">قیمت فروش ما (Bid)<br><b>${fmt(x.bid/10)} تومان</b></div>
-<div class="cell">قیمت خرید ما (Ask)<br><b>${fmt(x.ask/10)} تومان</b></div>
-<div class="cell">حجم سفارش خرید<br><b>${fmt(x.bid_qty)}</b></div>
-<div class="cell">حجم سفارش فروش<br><b>${fmt(x.ask_qty)}</b></div>
-<div class="cell">فاصله خرید و فروش<br><b>${fmt(x.spread)}٪</b></div>
-<div class="cell">قیمت اعمال<br><b>${fmt(x.strike/10)} تومان</b></div>
-<div class="cell">ضریب قرارداد<br><b>${fmt(x.contract_size)}</b></div>
-<div class="cell">هزینه خرید یک قرارداد (بدون کارمزد)<br><b>${fmt(x.ask*x.contract_size/10)} تومان</b></div>
-</div>
-<p class="muted target-info">${targetInfo(x)}</p>
-<p class="muted">ارزیابی: ${x.note}</p>
-</div>`;
+const node=element('div','card');
+node.dataset.targetKey=x.type+':'+x.symbol;
+const title=element('h3',null,x.symbol+' ');
+title.append(element('span','tag',x.type));
+const grid=element('div','grid');
+for(const [label,value] of [
+['روز تا سررسید',fmt(x.days)],
+['قیمت سهم پایه',fmt(x.spot/10)+' تومان'],
+['قیمت فروش ما (Bid)',fmt(x.bid/10)+' تومان'],
+['قیمت خرید ما (Ask)',fmt(x.ask/10)+' تومان'],
+['حجم سفارش خرید',fmt(x.bid_qty)],
+['حجم سفارش فروش',fmt(x.ask_qty)],
+['فاصله خرید و فروش',fmt(x.spread)+'٪'],
+['قیمت اعمال',fmt(x.strike/10)+' تومان'],
+['ضریب قرارداد',fmt(x.contract_size)],
+['هزینه خرید یک قرارداد (بدون کارمزد)',fmt(x.ask*x.contract_size/10)+' تومان']
+]){
+const cell=element('div','cell',label);
+cell.append(element('br'),element('b',null,value));
+grid.append(cell);
+}
+node.append(title,grid,element('p','muted target-info',targetInfo(x)),
+element('p','muted','ارزیابی: '+x.note));
+return node;
+}
+function renderCards(id,items){
+const container=document.getElementById(id);
+if(items.length)container.replaceChildren(...items.map(card));
+else container.textContent='قرارداد واجد شرایطی برای نمایش وجود ندارد.';
 }
 function refreshTargets(){
 document.querySelectorAll('.card[data-target-key]').forEach(card=>{
@@ -179,16 +197,11 @@ document.getElementById('decision').textContent =
 d.snapshot_warning + ' تعداد قراردادهای عبورکرده از فیلتر اولیه: ' + fmt(d.count) +
 (d.count ? '؛ این به معنی سیگنال خرید نیست.' : '');
 
-document.getElementById('calls').textContent =
-d.calls.length ? '' : 'قرارداد واجد شرایطی برای نمایش وجود ندارد.';
 window.lastScanItems=new Map([...d.calls,...d.puts].map(x=>[x.type+':'+x.symbol,x]));
-document.getElementById('calls').innerHTML=d.calls.map(card).join('');
-
-document.getElementById('puts').textContent =
-d.puts.length ? '' : 'قرارداد واجد شرایطی برای نمایش وجود ندارد.';
-if(d.puts.length) document.getElementById('puts').innerHTML=d.puts.map(card).join('');
+renderCards('calls',d.calls);
+renderCards('puts',d.puts);
 }catch(e){
-document.getElementById('status').innerHTML='<span class="bad">دریافت ناموفق</span>';
+document.getElementById('status').replaceChildren(element('span','bad','دریافت ناموفق'));
 document.getElementById('decision').textContent=e.message;
 }finally{b.disabled=false;b.textContent='دریافت و بررسی دوباره';}
 }
