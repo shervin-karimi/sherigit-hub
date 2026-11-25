@@ -249,13 +249,17 @@ def checked_clock(at, previous=None):
     return at
 
 
-def collect(*, timeout=REQUEST_TIMEOUT, backoff=RETRY_BACKOFF, gate=None):
+def collect(*, timeout=REQUEST_TIMEOUT, backoff=RETRY_BACKOFF, gate=None,
+            stream=None, max_attempts=MAX_ATTEMPTS, before_attempt=None):
     """Capture once; gate (if supplied) checks each attempt and its receipt."""
     watch.require(math.isfinite(timeout) and 0 < timeout <= 120, "timeout must be in (0, 120] seconds")
     watch.require(math.isfinite(backoff) and 0 <= backoff <= 60, "backoff must be in [0, 60] seconds")
-    STREAM.mkdir(parents=True, exist_ok=True)
-    with locked(STREAM, exclusive=True) as fd:
-        prior = read_stream(STREAM)
+    watch.require(type(max_attempts) is int and 1 <= max_attempts <= MAX_ATTEMPTS,
+                  "invalid maximum number of capture attempts")
+    stream = STREAM if stream is None else stream
+    stream.mkdir(parents=True, exist_ok=True)
+    with locked(stream, exclusive=True) as fd:
+        prior = read_stream(stream)
         old = watch.records_in_order(watch.DEFAULT_ARCHIVE) if os.path.lexists(watch.DEFAULT_ARCHIVE) else []
         blocked_hashes = set()
         for _, _, path, meta in old:
@@ -264,23 +268,25 @@ def collect(*, timeout=REQUEST_TIMEOUT, backoff=RETRY_BACKOFF, gate=None):
         latest = max([utc(row["receipt_utc"]) for row in prior[-1:]] + [row[0] for row in old[-1:]],
                      default=None)
         previous = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             started = checked_clock(utc_now(), previous)
             if gate is not None:
                 gate(started)
             watch.require(latest is None or started >= latest + MIN_INTERVAL,
                           "minimum 60 seconds between captures or local clock moved backward")
+            if before_attempt is not None:
+                before_attempt(started)
             try:
                 raw, received, headers = fetch(timeout=timeout)
             except (OSError, HTTPException) as error:
                 reason = transient_transport(error)
-                if reason is None or attempt == MAX_ATTEMPTS:
+                if reason is None or attempt == max_attempts:
                     raise
                 previous = checked_clock(utc_now(), started)
                 if gate is not None:
                     gate(previous)
                 delay = backoff * 2 ** (attempt - 1)
-                log_event("capture_retry", attempt=attempt, max_attempts=MAX_ATTEMPTS,
+                log_event("capture_retry", attempt=attempt, max_attempts=max_attempts,
                           retry_in_seconds=delay, reason=reason, error_type=type(error).__name__,
                           at_utc=previous.isoformat())
                 time.sleep(delay)
@@ -288,7 +294,7 @@ def collect(*, timeout=REQUEST_TIMEOUT, backoff=RETRY_BACKOFF, gate=None):
             checked_clock(received, started)
             if gate is not None:
                 gate(received)
-            return append(STREAM, fd, prior, raw, started, received, headers,
+            return append(stream, fd, prior, raw, started, received, headers,
                           blocked_hashes=blocked_hashes)
 
 

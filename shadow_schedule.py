@@ -45,27 +45,35 @@ def containing(spans, at):
     return next((span for span in spans if span[0] <= at < span[1]), None)
 
 
+def schedule_slot(sessions, windows, at):
+    local = at.astimezone(ZoneInfo("Asia/Tehran"))
+    day = local.date().isoformat()
+    if day not in sessions:
+        return None, "no_listed_session"
+    session = containing(sessions[day], local.time())
+    if session is None:
+        return None, "outside_session_hours"
+    window = containing(windows, local.time())
+    if window is None:
+        return None, "outside_collection_window"
+    return (day, session, window), None
+
+
 def scheduled_capture(calendar, windows, *, dry_run=False, **network):
     sessions, digest = load_calendar(calendar)
     windows = intervals(windows)
     try:
-        tehran = ZoneInfo("Asia/Tehran")
+        ZoneInfo("Asia/Tehran")
     except ZoneInfoNotFoundError as error:
         raise watch.ArchiveError("Asia/Tehran timezone data is required") from error
 
     def active(at):
-        local = at.astimezone(tehran)
-        day = local.date().isoformat()
-        fields = {"at_tehran": local.isoformat(), "calendar_sha256": digest}
-        if day not in sessions:
-            raise collector.CaptureSkipped("no_listed_session", **fields)
-        session = containing(sessions[day], local.time())
-        if session is None:
-            raise collector.CaptureSkipped("outside_session_hours", **fields)
-        window = containing(windows, local.time())
-        if window is None:
-            raise collector.CaptureSkipped("outside_collection_window", **fields)
-        return (day, session, window), fields
+        slot, reason = schedule_slot(sessions, windows, at)
+        fields = {"at_tehran": at.astimezone(ZoneInfo("Asia/Tehran")).isoformat(),
+                  "calendar_sha256": digest}
+        if reason is not None:
+            raise collector.CaptureSkipped(reason, **fields)
+        return slot, fields
 
     initial = collector.checked_clock(collector.utc_now())
     slot, fields = active(initial)
