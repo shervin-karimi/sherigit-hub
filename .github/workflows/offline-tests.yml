@@ -32,32 +32,51 @@ jobs:
           path: ${{ runner.temp }}/pytest-nodeids.txt
           if-no-files-found: error
       - name: Check legacy dashboard in headless Chrome
-        run: umask 022 && python -B -m browser_tests.legacy_dashboard --check legacy
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          echo "#### Legacy dashboard (Python ${{ matrix.python-version }})" | tee -a "$GITHUB_STEP_SUMMARY"
+          umask 022
+          python -B -m browser_tests.legacy_dashboard --check legacy 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check pilot success page in headless Chrome
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          echo "#### Pilot success page (Python ${{ matrix.python-version }})" | tee -a "$GITHUB_STEP_SUMMARY"
+          umask 022
+          python -B -m browser_tests.legacy_dashboard --check success 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Check pilot 503 pages in headless Chrome
-        run: umask 022 && python -B -m browser_tests.legacy_dashboard --check pilot
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          echo "#### Pilot 503 pages (Python ${{ matrix.python-version }})" | tee -a "$GITHUB_STEP_SUMMARY"
+          umask 022
+          python -B -m browser_tests.legacy_dashboard --check pilot 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare collected tests with the last successful run
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           BASELINE_BRANCH: ${{ github.base_ref || github.ref_name }}
           PYTHON_VERSION: ${{ matrix.python-version }}
           LC_ALL: C
         run: |
+          set -o pipefail
           run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow offline-tests.yml \
             --branch "$BASELINE_BRANCH" --status success --limit 30 --json databaseId,number,event \
             --jq "map(select(.number < $GITHUB_RUN_NUMBER and .event != \"pull_request\")) | first | .databaseId // empty")
-          if [[ -z "$run" ]]; then
-            echo 'Test inventory comparison: no previous successful branch run.' | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=pytest-nodeids-$PYTHON_VERSION" \
-            --jq '.artifacts[] | select(.expired == false) | .id')
-          if [[ -z "$artifact" ]]; then
-            echo "Test inventory comparison: run $run has no inventory for Python $PYTHON_VERSION." | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           baseline=$(mktemp -d "$RUNNER_TEMP/inventory-baseline.XXXXXX")
-          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "pytest-nodeids-$PYTHON_VERSION" --dir "$baseline"
-          python -B compare_inventories.py "$baseline/pytest-nodeids.txt" \
-            "$RUNNER_TEMP/pytest-nodeids.txt" --label "vs run $run / Python $PYTHON_VERSION" > "$baseline/comparison.txt"
-          cat "$baseline/comparison.txt"
-          cat "$baseline/comparison.txt" >> "$GITHUB_STEP_SUMMARY"
+          baseline_file="$baseline/missing-baseline.txt"
+          if [[ -n "$run" ]]; then
+            artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=pytest-nodeids-$PYTHON_VERSION" \
+              --jq '.artifacts[] | select(.expired == false) | .id')
+            if [[ -n "$artifact" ]]; then
+              gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "pytest-nodeids-$PYTHON_VERSION" --dir "$baseline"
+              baseline_file="$baseline/pytest-nodeids.txt"
+            fi
+          fi
+          code=0
+          python -B compare_inventories.py "$baseline_file" \
+            "$RUNNER_TEMP/pytest-nodeids.txt" --label "vs run ${run:-none} / Python $PYTHON_VERSION" \
+            --baseline-run "${run:-none}" > "$baseline/comparison.txt" || code=$?
+          tee -a "$GITHUB_STEP_SUMMARY" < "$baseline/comparison.txt"
+          exit "$code"

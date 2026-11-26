@@ -227,19 +227,29 @@ python -B run_offline_tests.py
 Use `python -B run_offline_tests.py --inventory /path/to/pytest-nodeids.txt`
 to save the sorted list of collected test IDs (not runtime subtests). CI
 publishes this file as the `pytest-nodeids-<python-version>` artifact for comparison across runs.
-CI logs added and removed IDs relative to the latest successful branch run
-(the target branch for pull requests), when its inventory is available, using
-`compare_inventories.py`. Actions pinned to major v7 run on Node.js 24.
+CI compares IDs with the latest successful branch run (the target branch for
+pull requests) using `compare_inventories.py`. An unauthorized removed test ID
+fails the job; intentional removals must be listed with a reason, approver and
+date in `test-inventory-removals.json`. A missing baseline is never silent: it
+prints an explicit error and fails unless that run is listed as a documented
+baseline exemption in the same file. Actions pinned to major v7 run on Node.js 24.
 Before discovery, an isolated fixture checks that the guard rejects an external
 connect event and writes to a protected path while allowing loopback. Another
 fixture checks that guarded replay children stop immediately on a blocked write,
-external connect or DNS lookup event. CI runs the suite and both browser checks
+external connect or DNS lookup event. CI runs the suite and every browser check
 under `umask 022` so tests cannot depend on a permissive local default. The
-browser checks use Chrome or Chromium with stubbed scan responses and real pilot
-503 pages for missing, legacy and invalid reports; CI runs them as separate
-steps: `python -B -m browser_tests.legacy_dashboard --check legacy` and
-`python -B -m browser_tests.legacy_dashboard --check pilot` (omit `--check` to
-run all checks locally).
+browser checks use Chrome or Chromium with stubbed scan responses, a successful
+HTTP 200 page with search/side/status/pagination filters, and real pilot 503
+pages for missing, legacy and invalid reports. Each browser check is an
+independent CI step with `if: ${{ !cancelled() }}`, and its result is appended to
+`GITHUB_STEP_SUMMARY`. Locally: `python -B -m browser_tests.legacy_dashboard
+--check legacy|success|pilot` (omit `--check` to run all checks).
+
+For deployment preparation without any live request or service activation, run
+`python -B vps_preflight.py --config … --unit …` as described in
+`VPS_PREFLIGHT.md`. The staged plan for any future real-data work, including
+Greeks/IV evidence and paper-only P&L review, is in `REAL_DATA_OPERATIONS.md`;
+it requires separate explicit approval before collection or scheduling.
 
 The three TSETMC diagnostic scripts run their requests only when executed
 directly. Test discovery imports them without contacting TSETMC. The
