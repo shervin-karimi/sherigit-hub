@@ -112,29 +112,44 @@ def replay_bootstrap(protected_path):
             + '\nimport runpy\nrunpy.run_path(sys.argv[1], run_name="__main__")\n')
 
 
-with TemporaryDirectory() as directory:
-    fixture_root = Path(directory)
-    protected_fixture = fixture_root / "protected"
-    protected_fixture.mkdir()
-    target = protected_fixture / "fixture.txt"
-    target.write_text("untouched", encoding="utf-8")
-    script = fixture_root / "replay_fixture.py"
-    script.write_text(
-        "from pathlib import Path\n"
-        "print('replay started', flush=True)\n"
-        "try:\n"
-        f"    Path({str(target)!r}).write_text('changed')\n"
-        "finally:\n"
-        "    print('replay continued', flush=True)\n", encoding="utf-8")
-    replay_probe = subprocess.run(
-        [sys.executable, "-I", "-S", "-B", "-c", replay_bootstrap(protected_fixture), str(script)],
-        capture_output=True, text=True, timeout=15)
-    if (replay_probe.returncode != 96 or replay_probe.stdout.strip() != "replay started"
-            or "OFFLINE GUARD BLOCKED open" not in replay_probe.stderr
-            or target.read_text(encoding="utf-8") != "untouched"):
-        sys.stderr.write(replay_probe.stderr)
-        sys.exit(f"Offline replay child self-check failed (exit {replay_probe.returncode})")
-print("OFFLINE_REPLAY_CHILD_SELF_CHECK passed", flush=True)
+def replay_child_check(source, expected_event, label):
+    with TemporaryDirectory() as directory:
+        fixture_root = Path(directory)
+        protected_fixture = fixture_root / "protected"
+        protected_fixture.mkdir(mode=0o700)
+        target = protected_fixture / "fixture.txt"
+        target.write_text("untouched", encoding="utf-8")
+        script = fixture_root / "replay_fixture.py"
+        script.write_text(source.replace("__TARGET__", repr(str(target))), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", replay_bootstrap(protected_fixture), str(script)],
+            capture_output=True, text=True, timeout=15)
+        unchanged = target.read_text(encoding="utf-8") == "untouched"
+    if (result.returncode != 96 or result.stdout.strip() != "replay started"
+            or "replay continued" in result.stdout
+            or f"OFFLINE GUARD BLOCKED {expected_event}" not in result.stderr
+            or not unchanged):
+        sys.stderr.write(result.stderr)
+        sys.exit(f"Offline replay child self-check ({label}) failed (exit {result.returncode})")
+    print(f"OFFLINE_REPLAY_{label}_CHILD_SELF_CHECK passed", flush=True)
+
+
+replay_child_check(
+    "from pathlib import Path\n"
+    "print('replay started', flush=True)\n"
+    "try:\n"
+    "    Path(__TARGET__).write_text('changed')\n"
+    "finally:\n"
+    "    print('replay continued', flush=True)\n",
+    "open", "WRITE")
+replay_child_check(
+    "import socket, sys\n"
+    "print('replay started', flush=True)\n"
+    "with socket.socket() as connection:\n"
+    "    connection.bind(('127.0.0.1', 0))\n"
+    "    sys.audit('socket.connect', connection, ('192.0.2.1', 443))\n"
+    "print('replay continued', flush=True)\n",
+    "socket.connect", "CONNECT")
 print("OFFLINE_GUARD_SELF_CHECK passed", flush=True)
 
 exec(bootstrap)

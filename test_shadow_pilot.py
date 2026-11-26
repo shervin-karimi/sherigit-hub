@@ -157,7 +157,16 @@ class PilotTests(unittest.TestCase):
                                      "--expected-head", expected_heads[-1]])
             return status, json.loads(out.getvalue())
 
+        def verify_error_cli(root, head=expected_heads[-1]):
+            out = StringIO()
+            with patch("shadow_pilot.os.umask"), patch("shadow_collector.log_event"), redirect_stdout(out):
+                status = pilot.main(["verify-archive", "--root", str(root),
+                                     "--expected-count", "2", "--expected-head", head])
+            return status, json.loads(out.getvalue())
+
         self.assertEqual(verify_cli(backup), (0, {"count": 2, "head_sha256": expected_heads[-1], "matches": True}))
+        self.assertEqual(verify_error_cli(backup, head="not-a-hash"),
+                         (1, {"error": "archive verification failed"}))
         with self.assertRaises(ValueError):
             pilot.inspect_archive(backup, expected_count=2)
         with self.assertRaises(ValueError):
@@ -184,6 +193,15 @@ class PilotTests(unittest.TestCase):
         (incomplete / "observations" / "00000002" / "seal.json").unlink()
         with self.assertRaises(watch.ArchiveError):
             pilot.inspect_archive(incomplete)
+        self.assertEqual(verify_error_cli(incomplete), (1, {"error": "archive verification failed"}))
+
+        reordered = self.root / "reordered"
+        copytree(backup, reordered)
+        stream = reordered / "observations"
+        (stream / "00000001").rename(stream / "swap")
+        (stream / "00000002").rename(stream / "00000001")
+        (stream / "swap").rename(stream / "00000002")
+        self.assertEqual(verify_error_cli(reordered), (1, {"error": "archive verification failed"}))
 
         damaged = self.root / "damaged"
         copytree(backup, damaged)
@@ -192,6 +210,7 @@ class PilotTests(unittest.TestCase):
         payload.write_bytes(body(102))
         with self.assertRaises(watch.ArchiveError):
             seal_heads(damaged)
+        self.assertEqual(verify_error_cli(damaged), (1, {"error": "archive verification failed"}))
 
         self.output.rename(self.root / "original")
         copytree(backup, self.output)

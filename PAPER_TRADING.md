@@ -232,8 +232,10 @@ CI logs added and removed IDs relative to the latest successful branch run
 `compare_inventories.py`. Actions pinned to major v7 run on Node.js 24.
 Before discovery, an isolated fixture checks that the guard rejects an external
 connect event and writes to a protected path while allowing loopback. Another
-fixture checks that a guarded replay child stops immediately on a blocked write. The
-separate browser check runs with Chrome or Chromium and stubbed scan responses:
+fixture checks that guarded replay children stop immediately on a blocked write
+or an external connect event. CI runs the suite under `umask 022` so tests cannot
+depend on a permissive local default. The separate browser check runs with Chrome
+or Chromium and stubbed scan responses plus a real pilot 503 page:
 `python -B -m browser_tests.legacy_dashboard`.
 
 The three TSETMC diagnostic scripts run their requests only when executed

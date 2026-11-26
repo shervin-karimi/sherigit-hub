@@ -461,14 +461,19 @@ def main(argv=None):
     os.umask(0o077)
     try:
         if args.action == "verify-archive":
-            result = inspect_archive(args.root, expected_count=args.expected_count, expected_head=args.expected_head)
+            try:
+                result = inspect_archive(args.root, expected_count=args.expected_count, expected_head=args.expected_head)
+            except (OSError, ValueError) as error:
+                collector.log_event("verify_archive_failed", reason=str(error))
+                result = {"error": "archive verification failed"}
         else:
             result = status(args.config) if args.action == "status" else tick(args.config, dry_run=args.action == "check")
     except (OSError, ValueError, ZoneInfoNotFoundError) as error:
         collector.log_event("pilot_failed", reason=str(error))
         return 1
     print(collector.json_bytes(result).decode(), end="")
-    return int(result.get("matches") is False or bool(result.get("هشدارهای عملیاتی")))
+    return int(result.get("matches") is False or "error" in result
+               or bool(result.get("هشدارهای عملیاتی")))
 
 
 if __name__ == "__main__":

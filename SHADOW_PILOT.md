@@ -88,7 +88,10 @@ python3 -B shadow_pilot.py verify-archive --root "$backup" \
 
 Use the first command to record `count` and `head_sha256`, and the second to
 compare both values. A mismatch exits nonzero. For zero records the head is
-`empty`. Repeat the comparison against the staged restore.
+`empty`. Repeat the comparison against the staged restore. A damaged, incomplete
+or out-of-order archive, or malformed expected values, produce the stable output
+`{"error": "archive verification failed"}` and exit 1; the path and raw error are
+kept in the private journal, not in the command output.
 
 The offline drill restores two synthetic observations and their report, rejects
 a damaged copy and verifies the restored rate limit.

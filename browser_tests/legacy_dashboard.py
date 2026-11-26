@@ -1,12 +1,17 @@
 """Exercise the actual dashboard script in Chrome with synthetic scan responses."""
 
 import argparse
+from datetime import datetime, timezone
+from http.client import HTTPConnection
 import shutil
 import subprocess
 from pathlib import Path
+import threading
 from tempfile import TemporaryDirectory
 
 from app import HTML
+from shadow_pilot import atomic_json, load_state, private_directory
+from shadow_pilot_dashboard import HOST, PilotServer
 
 
 SCENARIO = """
@@ -54,6 +59,42 @@ SCENARIO = """
 """
 
 
+def check_pilot_503(chrome):
+    """Fetch a real 503 page from the pilot server and render it in Chrome."""
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary) / "pilot"
+        private_directory(root / "reports")
+        atomic_json(root / "state.json", load_state(root / "state.json"))
+        server = PilotServer(root, 0, clock=lambda: datetime(2026, 11, 22, 6, tzinfo=timezone.utc))
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        try:
+            client = HTTPConnection(HOST, server.server_port, timeout=5)
+            try:
+                client.request("GET", "/")
+                response = client.getresponse()
+                status, html = response.status, response.read().decode("utf-8")
+            finally:
+                client.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+        if status != 503:
+            raise SystemExit(f"Pilot 503 page returned {status}")
+        page = Path(temporary) / "pilot-503.html"
+        page.write_text(html, encoding="utf-8")
+        result = subprocess.run([
+            chrome, "--headless", "--disable-background-networking", "--disable-component-update",
+            "--no-first-run", "--no-proxy-server", "--host-resolver-rules=MAP * ~NOTFOUND",
+            f"--user-data-dir={Path(temporary) / 'pilot-profile'}", "--dump-dom", page.as_uri(),
+        ], capture_output=True, encoding="utf-8", timeout=45)
+    guidance = "اقدام: منتظر اجرای بعدی زمانبند بمانید"
+    if result.returncode or guidance not in result.stdout:
+        raise SystemExit(f"Pilot 503 browser check failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
+    print("PILOT_503_BROWSER_CHECK passed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chrome", default=shutil.which("google-chrome") or shutil.which("chromium"))
@@ -75,6 +116,7 @@ def main():
         tail = result.stdout.rpartition("</script>")[2]
         raise SystemExit(f"Dashboard browser check failed ({result.returncode}):\n{tail}\n{result.stderr}")
     print("LEGACY_DASHBOARD_BROWSER_CHECK passed")
+    check_pilot_503(args.chrome)
 
 
 if __name__ == "__main__":
