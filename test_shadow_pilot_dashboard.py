@@ -136,6 +136,52 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request()[0], 503)
         self.assertIn("این گزارش تاریخی یا قدیمی است", self.request("/?day=2026-11-22")[2])
 
+    def test_recent_incomplete_tick_hides_capacity_despite_previous_heartbeat(self):
+        self.ingest(paper=True)
+        self.start()
+        no_capacity = "<td>نامعلوم</td>"
+        self.assertNotIn(no_capacity, self.request()[2])
+        state_path = self.root / "state.json"
+        state = pilot.load_state(state_path)
+        self.fixture.now += timedelta(seconds=30)
+        state["last_tick"] = self.fixture.now.isoformat()
+        pilot.atomic_json(state_path, state)
+        before = self.digest()
+        code, _, html = self.request()
+        self.assertEqual(code, 200)
+        self.assertIn("گزارش قدیمی یا ناقص", html)
+        self.assertIn(no_capacity, html)
+        self.assertEqual(self.digest(), before)
+
+    def test_sell_capacity_expires_even_while_report_is_fresh(self):
+        self.fixture.enable_paper()
+        self.fixture.sign(1, entries=[("dashboard-expiry", 1)], quote_changes={
+            "quoted_at": (self.fixture.now - timedelta(minutes=4)).isoformat(),
+        })
+        report = self.fixture.report()
+        rows = report["دفتر آزمایشی"]["موقعیت‌های ربات"]
+        self.assertEqual(rows[0]["ظرفیت فروش هر سفارش"], 1)
+        self.start()
+        self.fixture.now += timedelta(seconds=59)
+        self.assertNotIn("<td>نامعلوم</td>", self.request()[2])
+        self.fixture.now += timedelta(seconds=1)
+        code, _, html = self.request()
+        self.assertEqual(code, 200)
+        self.assertNotIn("این گزارش تاریخی یا قدیمی است", html)
+        self.assertIn("<td>نامعلوم</td>", html)
+
+    def test_report_without_contract_table_fails_closed(self):
+        report = self.ingest()
+        del report["مشاهدات و غربال پژوهشی"]["قراردادها"]
+        pilot.atomic_json(self.root / "reports" / "2026-11-22.json", report)
+        self.start()
+        before = self.digest()
+        code, _, html = self.request()
+        self.assertEqual(code, 503)
+        self.assertIn("گزارش این تاریخ در دسترس نیست", html)
+        self.assertNotIn(str(self.root), html)
+        self.assertEqual(self.digest(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

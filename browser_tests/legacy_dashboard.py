@@ -1,0 +1,81 @@
+"""Exercise the actual dashboard script in Chrome with synthetic scan responses."""
+
+import argparse
+import shutil
+import subprocess
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from app import HTML
+
+
+SCENARIO = """
+<script>
+(async () => {
+  function check(condition, message) {
+    if (!condition) throw new Error(message);
+  }
+  try {
+    const symbol = '<em data-fixture="symbol">نماد & "آزمایشی"</em>';
+    const note = '<strong data-fixture="note">توضیح آزمون</strong>';
+    const contract = {symbol, note, type: 'CALL', ask: 100, contract_size: 10};
+    const responses = [
+      {calls: [contract], puts: [{...contract, type: 'PUT'}], count: 2},
+      {calls: [], puts: [], count: 0}
+    ];
+    window.fetch = async url => {
+      check(url === '/api/scan' && responses.length, 'unexpected fetch');
+      const data = {total: 2, snapshot_age_seconds: 0, ...responses.shift()};
+      return {ok: true, json: async () => data};
+    };
+    await scan();
+    for (const [id, side] of [['calls', 'CALL'], ['puts', 'PUT']]) {
+      const card = document.querySelector(`#${id} .card`);
+      check(card && card.dataset.targetKey === side + ':' + symbol, 'missing card or incorrect key');
+      check(card.querySelector('h3').textContent === symbol + ' ' + side, 'symbol not literal');
+      check(card.textContent.includes(note), 'note not literal');
+      check(!card.querySelector('[data-fixture]'), 'market text became markup');
+    }
+    await scan();
+    for (const id of ['calls', 'puts']) {
+      const list = document.getElementById(id);
+      check(!list.children.length, 'stale card');
+      check(list.textContent === 'قرارداد واجد شرایطی برای نمایش وجود ندارد.', 'missing empty message');
+    }
+    document.body.dataset.browserCheck = 'passed';
+  } catch (error) {
+    document.body.dataset.browserCheck = 'failed';
+    const diagnostic = document.createElement('pre');
+    diagnostic.textContent = error.message;
+    document.body.append(diagnostic);
+  }
+})();
+</script>
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--chrome", default=shutil.which("google-chrome") or shutil.which("chromium"))
+    args = parser.parse_args()
+    if not args.chrome:
+        parser.error("Chrome or Chromium is required (or pass --chrome PATH)")
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        page = root / "dashboard.html"
+        fixture = HTML.replace("<head>", '<head><meta http-equiv="Content-Security-Policy" '
+                               'content="connect-src \'none\'">', 1)
+        page.write_text(fixture.replace("</body>", SCENARIO + "</body>", 1), encoding="utf-8")
+        result = subprocess.run([
+            args.chrome, "--headless", "--disable-background-networking", "--disable-component-update",
+            "--no-first-run", "--no-proxy-server", "--host-resolver-rules=MAP * ~NOTFOUND",
+            f"--user-data-dir={root / 'profile'}", "--dump-dom", page.as_uri(),
+        ], capture_output=True, encoding="utf-8", timeout=45)
+    if result.returncode or 'data-browser-check="passed"' not in result.stdout:
+        tail = result.stdout.rpartition("</script>")[2]
+        raise SystemExit(f"Dashboard browser check failed ({result.returncode}):\n{tail}\n{result.stderr}")
+    print("LEGACY_DASHBOARD_BROWSER_CHECK passed")
+
+
+if __name__ == "__main__":
+    main()

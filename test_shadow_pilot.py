@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 from pathlib import Path
+from shutil import copytree
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -126,6 +127,44 @@ class PilotTests(unittest.TestCase):
         self.fetch.assert_called_once()
         self.now += timedelta(minutes=4)
         self.assertEqual(pilot.status(self.config)["وضعیت"], "گزارش قدیمی یا ناقص")
+
+    def test_observation_backup_restores_seals_report_and_attempt_reservation(self):
+        def seal_heads(directory):
+            stream = directory / "observations"
+            with collector.locked(stream, exclusive=False):
+                return [row["head_sha256"] for row in READ_STREAM(stream, collector.SYNTHETIC)]
+
+        self.report()
+        self.now += timedelta(seconds=120)
+        self.fetch.side_effect = lambda **_: (body(101), self.now, {})
+        self.report()
+        expected_heads = seal_heads(self.output)
+        self.assertEqual(len(expected_heads), 2)
+        report_path = self.output / "reports" / "2026-11-22.json"
+        report_bytes = report_path.read_bytes()
+        backup = self.root / "backup"
+        copytree(self.output, backup)
+        self.assertEqual(seal_heads(backup), expected_heads)
+
+        damaged = self.root / "damaged"
+        copytree(backup, damaged)
+        payload = damaged / "observations" / "00000002" / "body.raw.json"
+        payload.unlink()
+        payload.write_bytes(body(102))
+        with self.assertRaises(watch.ArchiveError):
+            seal_heads(damaged)
+
+        self.output.rename(self.root / "original")
+        copytree(backup, self.output)
+        self.assertEqual(seal_heads(self.output), expected_heads)
+        self.assertEqual(report_path.read_bytes(), report_bytes)
+        self.assertEqual(pilot.status(self.config)["وضعیت"], "ok")
+        self.now += timedelta(seconds=30)
+        result = self.report()
+        self.assertEqual(result["گردآوری"]["علت"], "persistent_capture_rate_limit")
+        self.assertEqual(result["مشاهدات و غربال پژوهشی"]["تعداد ثبت روز"], 2)
+        self.assertEqual(self.fetch.call_count, 2)
+        self.assertEqual(seal_heads(self.output), expected_heads)
 
     def test_unsigned_observations_cannot_open_paper_positions(self):
         self.enable_paper()

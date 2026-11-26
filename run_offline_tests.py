@@ -1,8 +1,16 @@
 """Run pytest with the project network, replay and data guards."""
 
-import hashlib, json, os, subprocess, sys
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--inventory", type=Path, help="write the collected pytest node IDs")
+options = parser.parse_args()
+inventory = options.inventory.absolute() if options.inventory else None
 root = Path(__file__).resolve().parent
 os.chdir(root)
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
@@ -54,6 +62,51 @@ def audit(event, args):
 
 sys.addaudithook(audit)
 '''
+
+# Run intentional denials in a separate interpreter so that the suite's
+# guard log contains only unexpected attempts. The fixture never uses data/.
+probe = '''
+import socket
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+with TemporaryDirectory() as directory:
+    protected = str(Path(directory) / "protected")
+    target = Path(protected) / "fixture.txt"
+    target.parent.mkdir()
+    target.write_text("untouched", encoding="utf-8")
+    child = False
+    exec(sys.argv[1])
+
+    def assert_blocked(event, operation):
+        try:
+            operation()
+        except AssertionError as error:
+            if error.args == (event,):
+                return
+            raise
+        raise AssertionError(f"guard did not block {event}")
+
+    with socket.socket() as connection:
+        connection.bind(("127.0.0.1", 0))
+        # Exercise the connect audit event without emitting a network packet.
+        assert_blocked("socket.connect", lambda: sys.audit(
+            "socket.connect", connection, ("192.0.2.1", 443)))
+    assert_blocked("open", lambda: target.write_text("changed", encoding="utf-8"))
+    assert_blocked("os.remove", target.unlink)
+    if target.read_text(encoding="utf-8") != "untouched":
+        raise AssertionError("guard probe changed its fixture")
+    # Disable just the fixture's path protection for TemporaryDirectory cleanup.
+    protected = str(Path(directory) / "unused")
+'''
+preflight = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", probe, bootstrap],
+                           capture_output=True, text=True, timeout=15)
+if preflight.returncode:
+    sys.stderr.write(preflight.stderr)
+    sys.exit("Offline guard self-check failed")
+print("OFFLINE_GUARD_SELF_CHECK passed", flush=True)
+
 exec(bootstrap)
 allowed = {str(root / name) for name in ("build_contracts.py", "calculate_greeks.py")}
 
@@ -85,7 +138,15 @@ def snapshot():
 before = snapshot()
 import pytest
 
-result = pytest.main(["-p", "no:cacheprovider", "-q", "--tb=short", str(root)])
+class Inventory:
+    def pytest_collection_finish(self, session):
+        ids = sorted(item.nodeid for item in session.items)
+        inventory.write_text("".join(f"{node_id}\n" for node_id in ids), encoding="utf-8")
+        print(f"COLLECTED_TEST_IDS {len(ids)}", flush=True)
+
+
+result = pytest.main(["-p", "no:cacheprovider", "-q", "--tb=short", str(root)],
+                     plugins=[Inventory()] if inventory else [])
 assert snapshot() == before, "Protected data changed"
 print("OFFLINE_GUARD_ATTEMPTS", blocked, "GUARDED_REPLAY_SUBPROCESSES", GuardedReplay.total,
       "DATA_UNCHANGED", len(before))

@@ -421,7 +421,9 @@ def status_for_root(root, now):
     verify_private_directory(root)
     state = load_state(root / "state.json")
     finished = collector.utc(state["last_finished"]) if state["last_finished"] else None
-    stale = finished is None or not timedelta(0) <= now - finished <= timedelta(minutes=3)
+    started = collector.utc(state["last_tick"]) if state["last_tick"] else None
+    stale = (finished is None or started is None or started > finished
+             or not timedelta(0) <= now - finished <= timedelta(minutes=3))
     return {"وضعیت": "گزارش قدیمی یا ناقص" if stale else state["result"], "سلامت": state}
 
 

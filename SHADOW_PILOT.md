@@ -61,6 +61,44 @@ journal. Back up the archive, report files, durable state and any opted-in
 SQLite ledger securely. Respect the venue’s collection policy and provide
 accurate clock synchronization. Omitted and out-of-session days do not fetch.
 
+### Observation-only backup and restore drill
+
+1. Stop the timer and service using the commands above. Keep them stopped
+   throughout the drill. In a private backup directory, use `cp -a -- "$root"
+   "$backup"` (with an unused destination) to copy the entire configured root,
+   including `observations/`, `reports/` and `state.json`. Keep the verified
+   calendar and configuration separately in private storage.
+2. Record the source record count and final seal hash separately from the copy.
+   Run the command below against the source, the backup and the staged restore.
+   Require identical results. Checking the chain alone cannot detect a copy
+   missing only its last records.
+3. Restore to an unused staging directory as the pilot user, preserving modes.
+   Once the archive matches, retain the previous root under a different name
+   and move the staged copy to the configured path on the same filesystem.
+   Run `shadow_pilot.py status --config PATH` and check that the durable capture
+   timestamps and latest report match the backup. A historical heartbeat may
+   legitimately be stale. Do not restore only the archive and discard state:
+   state includes the last reserved HTTP attempt.
+
+```sh
+python3 -B - "$root" <<'PY'
+from pathlib import Path
+import sys
+from shadow_collector import locked, read_stream
+
+stream = Path(sys.argv[1]) / "observations"
+with locked(stream, exclusive=False):
+    records = read_stream(stream)
+print(len(records), records[-1]["head_sha256"] if records else "empty")
+PY
+```
+
+The offline drill restores two synthetic observations and their report, rejects
+a damaged copy and verifies the restored rate limit. This procedure does not
+cover an opted-in paper ledger; the trusted-batch state and the external ledger
+need a coordinated backup from the same stopped point, including any SQLite
+sidecars, before that setup can be restored.
+
 ## Independent paper evidence
 
 The default is observation-only. TSETMC HTTP receipt time, HTTP headers and

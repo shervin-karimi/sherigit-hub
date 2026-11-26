@@ -224,6 +224,14 @@ python -m pip install -r requirements-test.txt
 python -B run_offline_tests.py
 ```
 
+Use `python -B run_offline_tests.py --inventory /path/to/pytest-nodeids.txt`
+to save the sorted list of collected test IDs (not runtime subtests). CI
+publishes this file as the `pytest-nodeids` artifact for comparison across runs.
+Before discovery, an isolated fixture checks that the guard rejects an external
+connect event and writes to a protected path while allowing loopback. The
+separate browser check runs with Chrome or Chromium and stubbed scan responses:
+`python -B -m browser_tests.legacy_dashboard`.
+
 The three TSETMC diagnostic scripts run their requests only when executed
 directly. Test discovery imports them without contacting TSETMC. The
 sensitivity test uses in-memory data. Run `sensitivity_test.py PATH` only
