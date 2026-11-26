@@ -100,6 +100,7 @@ class DashboardTests(unittest.TestCase):
         status, _, html = self.request()
         self.assertEqual(status, 503)
         self.assertIn("گزارش این تاریخ نامعتبر است", html)
+        self.assertIn("اقدام: فایل report را دستکاری نکنید", html)
         self.assertNotIn(str(self.root), html)
         report["مشاهدات و غربال پژوهشی"]["آخرین ثبت"]["exchange_quote_timestamp"] = None
         report["دفتر آزمایشی"] = []
@@ -109,6 +110,7 @@ class DashboardTests(unittest.TestCase):
         status, _, html = self.request()
         self.assertEqual(status, 503)
         self.assertIn("گزارش این تاریخ هنوز منتشر نشده است", html)
+        self.assertIn("اقدام: منتظر اجرای بعدی زمانبند بمانید", html)
         private = self.fixture.root / "private.json"
         private.write_text('{"secret":"do not disclose"}', encoding="utf-8")
         path.symlink_to(private)
@@ -190,6 +192,7 @@ class DashboardTests(unittest.TestCase):
         code, _, html = self.request()
         self.assertEqual(code, 503)
         self.assertIn("نسخهٔ قدیمی گزارش جدول قراردادها را ندارد", html)
+        self.assertIn("اقدام: اجازه دهید پایلوت بهروز شده یک تیک کامل منتشر کند", html)
         self.assertNotIn(str(self.root), html)
         self.assertEqual(self.digest(), before)
 

@@ -1,6 +1,6 @@
 """Deterministic pilot tests with temporary ledgers and synthetic HTTP bodies."""
 
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -8,7 +8,8 @@ import hmac
 from io import StringIO
 import json
 from pathlib import Path
-from shutil import copytree
+from shutil import copy2, copytree
+import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -157,10 +158,31 @@ class PilotTests(unittest.TestCase):
             return status, json.loads(out.getvalue())
 
         self.assertEqual(verify_cli(backup), (0, {"count": 2, "head_sha256": expected_heads[-1], "matches": True}))
+        with self.assertRaises(ValueError):
+            pilot.inspect_archive(backup, expected_count=2)
+        with self.assertRaises(ValueError):
+            pilot.inspect_archive(backup, expected_count=-1, expected_head="empty")
+        with self.assertRaises(ValueError):
+            pilot.inspect_archive(backup, expected_count=2, expected_head="not-a-hash")
+        empty_root = self.root / "empty-archive"
+        (empty_root / "observations").mkdir(mode=0o700, parents=True)
+        self.assertEqual(pilot.inspect_archive(empty_root), {"count": 0, "head_sha256": "empty"})
+        out = StringIO()
+        with patch("shadow_pilot.os.umask"), redirect_stdout(out):
+            code = pilot.main(["verify-archive", "--root", str(empty_root),
+                               "--expected-count", "0", "--expected-head", "empty"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"count": 0, "head_sha256": "empty", "matches": True})
         truncated = self.root / "truncated"
         copytree(backup, truncated)
         (truncated / "observations" / "00000002").rename(truncated / "unsealed-outside-stream")
         self.assertEqual(verify_cli(truncated), (1, {"count": 1, "head_sha256": expected_heads[0], "matches": False}))
+
+        incomplete = self.root / "incomplete"
+        copytree(backup, incomplete)
+        (incomplete / "observations" / "00000002" / "seal.json").unlink()
+        with self.assertRaises(watch.ArchiveError):
+            pilot.inspect_archive(incomplete)
 
         damaged = self.root / "damaged"
         copytree(backup, damaged)
@@ -181,6 +203,68 @@ class PilotTests(unittest.TestCase):
         self.assertEqual(result["مشاهدات و غربال پژوهشی"]["تعداد ثبت روز"], 2)
         self.assertEqual(self.fetch.call_count, 2)
         self.assertEqual(seal_heads(self.output), expected_heads)
+
+    def test_paper_ledger_and_pilot_state_restore_together(self):
+        self.enable_paper()
+        self.report()
+        self.sign(1, entries=[("restore-entry", 1)])
+        first = self.report()
+        self.assertIsNone(first["دفتر آزمایشی"]["مانع"])
+        history = self.ledger.history()
+        self.assertEqual(len(history), 1)
+        state_path = self.output / "state.json"
+        state = pilot.load_state(state_path)
+        self.assertEqual((state["last_sequence"], state["last_claimed"]), (1, 1))
+        self.assertEqual(state["paper_scope"][2], str(self.paths["db"].resolve()))
+        batch = (self.output / "trusted-batches" / "0000000000000000001.json").read_bytes()
+
+        suffix = ("-wal", "-shm", "-journal")
+        def copy_ledger(directory, name="paper.sqlite3"):
+            copy2(self.paths["db"], directory / name)
+            for item in suffix:
+                sidecar = Path(str(self.paths["db"]) + item)
+                if sidecar.exists():
+                    copy2(sidecar, Path(str(directory / name) + item))
+
+        def restore_ledger(directory, name="paper.sqlite3"):
+            for item in suffix:
+                Path(str(self.paths["db"]) + item).unlink(missing_ok=True)
+            copy2(directory / name, self.paths["db"])
+            for item in suffix:
+                sidecar = directory / f"{name}{item}"
+                if sidecar.exists():
+                    copy2(sidecar, Path(str(self.paths["db"]) + item))
+
+        backup = self.root / "paper-backup"
+        (backup / "pilot").mkdir(mode=0o700, parents=True)
+        # Hold a WAL connection open so the drill copies the sidecars too.
+        with closing(sqlite3.connect(self.paths["db"])) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            db.execute("UPDATE account SET initial_equity = initial_equity")
+            db.commit()
+            self.assertTrue(Path(str(self.paths["db"]) + "-wal").exists())
+            copytree(self.output, backup / "pilot", dirs_exist_ok=True)
+            copy_ledger(backup)
+
+        self.paths["db"].write_bytes(b"damaged ledger")
+        broken = pilot.load_state(state_path)
+        broken.update(last_sequence=0, last_claimed=0)
+        pilot.atomic_json(state_path, broken)
+        (self.output / "trusted-batches" / "0000000000000000001.json").unlink()
+        self.assertEqual(pilot.load_state(state_path)["last_sequence"], 0)
+        self.assertFalse((self.output / "trusted-batches" / "0000000000000000001.json").exists())
+
+        self.output.rename(self.root / "pre-restore")
+        copytree(backup / "pilot", self.output)
+        restore_ledger(backup)
+        self.assertEqual(self.ledger.history(), history)
+        self.assertEqual((self.output / "trusted-batches" / "0000000000000000001.json").read_bytes(), batch)
+        self.assertEqual(pilot.status(self.config)["وضعیت"], "ok")
+        self.assertIn("already processed", self.report()["دفتر آزمایشی"]["مانع"])
+        self.assertEqual(self.ledger.history(), history)
+        self.sign(2, entries=[("restore-entry-2", 1)])
+        self.assertIsNone(self.report()["دفتر آزمایشی"]["مانع"])
+        self.assertEqual(len(self.ledger.history()), 2)
 
     def test_unsigned_observations_cannot_open_paper_positions(self):
         self.enable_paper()

@@ -26,6 +26,14 @@ QUOTE_SHAPES = dict(zip(QUOTE_CLASSES, (
     "دوطرفه", "فقط خرید", "فقط فروش", "بدون مظنه", "قیمت خرید بالاتر از فروش", "ناسازگاری قیمت و عمق",
 ), strict=True))
 HEALTH = {"ok": "فعال", "degraded": "نیازمند بررسی"}
+REPORT_GUIDANCE = {
+    "گزارش این تاریخ هنوز منتشر نشده است.":
+        "منتظر اجرای بعدی زمانبند بمانید و وضعیت سرویس و Journal را بررسی کنید.",
+    "نسخهٔ قدیمی گزارش جدول قراردادها را ندارد.":
+        "اجازه دهید پایلوت بهروز شده یک تیک کامل منتشر کند؛ گزارش قدیمی را ویرایش نکنید.",
+    "گزارش این تاریخ نامعتبر است.":
+        "فایل report را دستکاری نکنید؛ مجوزهای پوشهٔ خصوصی را بررسی و در صورت نیاز از پشتیبان بازیابی کنید.",
+}
 POSITION_STATES = {"OPEN": "باز", "EXIT_PENDING": "در انتظار خروج", "EXPIRY_REVIEW": "در انتظار تسویه"}
 CAPTURE_REASONS = {
     "no_listed_session": "روز معاملاتی در تقویم ثبت نشده",
@@ -304,9 +312,11 @@ class PilotHandler(BaseHTTPRequestHandler):
 
     def unavailable(self, message, health, filters, today):
         status = health["وضعیت"]
+        guidance = REPORT_GUIDANCE.get(message)
+        action = f'<p class="pilot-muted">اقدام: {h(guidance)}</p>' if guidance else ""
         body = document(
             f'<p class="pilot-alert">{h(message)} وضعیت فعلی زمان‌بندی {h(HEALTH.get(status, status))} است.</p>'
-            + filters_form(filters, today)
+            + action + filters_form(filters, today)
         )
         return self.respond(503, body)
 

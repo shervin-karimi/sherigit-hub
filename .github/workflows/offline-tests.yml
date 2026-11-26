@@ -11,17 +11,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: requirements-test.txt
       - run: python -m pip install -r requirements-test.txt
       - run: python -B run_offline_tests.py --inventory "$RUNNER_TEMP/pytest-nodeids.txt"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: pytest-nodeids
@@ -50,8 +50,7 @@ jobs:
           fi
           baseline=$(mktemp -d "$RUNNER_TEMP/inventory-baseline.XXXXXX")
           gh run download "$run" --repo "$GITHUB_REPOSITORY" --name pytest-nodeids --dir "$baseline"
-          comm --check-order -13 "$baseline/pytest-nodeids.txt" "$RUNNER_TEMP/pytest-nodeids.txt" > "$baseline/added"
-          comm --check-order -23 "$baseline/pytest-nodeids.txt" "$RUNNER_TEMP/pytest-nodeids.txt" > "$baseline/removed"
-          echo "Test inventory vs run $run: $(wc -l < "$baseline/added") added, $(wc -l < "$baseline/removed") removed." | tee -a "$GITHUB_STEP_SUMMARY"
-          sed 's/^/Added: /' "$baseline/added"
-          sed 's/^/Removed: /' "$baseline/removed"
+          python -B compare_inventories.py "$baseline/pytest-nodeids.txt" \
+            "$RUNNER_TEMP/pytest-nodeids.txt" --label "vs run $run" > "$baseline/comparison.txt"
+          cat "$baseline/comparison.txt"
+          cat "$baseline/comparison.txt" >> "$GITHUB_STEP_SUMMARY"

@@ -228,7 +228,8 @@ Use `python -B run_offline_tests.py --inventory /path/to/pytest-nodeids.txt`
 to save the sorted list of collected test IDs (not runtime subtests). CI
 publishes this file as the `pytest-nodeids` artifact for comparison across runs.
 CI logs added and removed IDs relative to the latest successful branch run
-(the target branch for pull requests), when its inventory is available.
+(the target branch for pull requests), when its inventory is available, using
+`compare_inventories.py`. Actions pinned to major v7 run on Node.js 24.
 Before discovery, an isolated fixture checks that the guard rejects an external
 connect event and writes to a protected path while allowing loopback. Another
 fixture checks that a guarded replay child stops immediately on a blocked write. The

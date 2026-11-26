@@ -91,10 +91,31 @@ compare both values. A mismatch exits nonzero. For zero records the head is
 `empty`. Repeat the comparison against the staged restore.
 
 The offline drill restores two synthetic observations and their report, rejects
-a damaged copy and verifies the restored rate limit. This procedure does not
-cover an opted-in paper ledger; the trusted-batch state and the external ledger
-need a coordinated backup from the same stopped point, including any SQLite
-sidecars, before that setup can be restored.
+a damaged copy and verifies the restored rate limit.
+
+### Coordinated drill with an opted-in paper ledger
+
+For an opted-in pilot, stop the timer and service before copying anything. The
+ledger, the pilot root (including `trusted-batches/` and `state.json`) and the
+external trust files must come from the same stopped point. Copy the SQLite
+database together with any `-wal`, `-shm` or `-journal` sidecars, or use
+`sqlite3.Connection.backup` into a new file while no writer is active. Use
+`cp -a --` to preserve ownership and mode 0600; never keep only the main
+database file while a writer was active.
+
+Restore to an unused staging directory, verify the archive count and head, then
+move the pilot root and the ledger back to their configured absolute paths.
+Changing the ledger or key path changes the recorded paper scope, and the pilot
+will refuse to continue with that root. After restore:
+
+1. Run `shadow_pilot.py status --config PATH` and `verify-archive` as above.
+2. Re-submit the last batch. The report must block it as already processed; the
+   ledger history must not grow. A fresh batch must then be accepted once.
+3. Compare the restored trusted-batch record with the backup. Do not delete
+   `trusted-batches/` or reset `state.json` to force a replay.
+
+The offline drill performs these checks with a synthetic position and a WAL
+sidecar. Official settlement reconciliation remains blocked in `EXPIRY_REVIEW`.
 
 ## Independent paper evidence
 
@@ -157,6 +178,17 @@ Reports produced before this milestone lack the contract table. Let the
 updated pilot complete a tick to publish today's compatible report. Keep
 historical reports in private storage. The dashboard does not rewrite them
 or read raw archive bodies to reconstruct them.
+
+When a report cannot be shown, the 503 page names the cause and one action:
+
+| Message shown | Operator action |
+| --- | --- |
+| `گزارش این تاریخ هنوز منتشر نشده است.` | Wait for the next scheduled tick; check the timer, service and journal. |
+| `نسخهٔ قدیمی گزارش جدول قراردادها را ندارد.` | Let the updated pilot publish one complete tick; never edit an old report. |
+| `گزارش این تاریخ نامعتبر است.` | Do not modify the file; check private directory ownership and modes, then restore from backup if needed. |
+
+The `اقدام` guidance shown on the 503 page comes from `REPORT_GUIDANCE` in
+`shadow_pilot_dashboard.py`. Treat a 503 as unavailable data, never as a signal.
 
 ```sh
 install -m 644 deploy/shadow-pilot-dashboard.service ~/.config/systemd/user/
