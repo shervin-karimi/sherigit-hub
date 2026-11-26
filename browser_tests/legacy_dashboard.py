@@ -63,6 +63,7 @@ def check_pilot_503(chrome):
     """Fetch a real 503 page from the pilot server and render it in Chrome."""
     with TemporaryDirectory() as temporary:
         root = Path(temporary) / "pilot"
+        private_directory(root)
         private_directory(root / "reports")
         atomic_json(root / "state.json", load_state(root / "state.json"))
         server = PilotServer(root, 0, clock=lambda: datetime(2026, 11, 22, 6, tzinfo=timezone.utc))
