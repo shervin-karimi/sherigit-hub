@@ -81,17 +81,14 @@ accurate clock synchronization. Omitted and out-of-session days do not fetch.
    state includes the last reserved HTTP attempt.
 
 ```sh
-python3 -B - "$root" <<'PY'
-from pathlib import Path
-import sys
-from shadow_collector import locked, read_stream
-
-stream = Path(sys.argv[1]) / "observations"
-with locked(stream, exclusive=False):
-    records = read_stream(stream)
-print(len(records), records[-1]["head_sha256"] if records else "empty")
-PY
+python3 -B shadow_pilot.py verify-archive --root "$root"
+python3 -B shadow_pilot.py verify-archive --root "$backup" \
+  --expected-count "$saved_count" --expected-head "$saved_head"
 ```
+
+Use the first command to record `count` and `head_sha256`, and the second to
+compare both values. A mismatch exits nonzero. For zero records the head is
+`empty`. Repeat the comparison against the staged restore.
 
 The offline drill restores two synthetic observations and their report, rejects
 a damaged copy and verifies the restored rate limit. This procedure does not

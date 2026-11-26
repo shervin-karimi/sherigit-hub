@@ -99,12 +99,16 @@ class DashboardTests(unittest.TestCase):
         pilot.atomic_json(path, report)
         status, _, html = self.request()
         self.assertEqual(status, 503)
+        self.assertIn("گزارش این تاریخ نامعتبر است", html)
         self.assertNotIn(str(self.root), html)
         report["مشاهدات و غربال پژوهشی"]["آخرین ثبت"]["exchange_quote_timestamp"] = None
         report["دفتر آزمایشی"] = []
         pilot.atomic_json(path, report)
         self.assertEqual(self.request()[0], 503)
         path.unlink()
+        status, _, html = self.request()
+        self.assertEqual(status, 503)
+        self.assertIn("گزارش این تاریخ هنوز منتشر نشده است", html)
         private = self.fixture.root / "private.json"
         private.write_text('{"secret":"do not disclose"}', encoding="utf-8")
         path.symlink_to(private)
@@ -152,6 +156,13 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("گزارش قدیمی یا ناقص", html)
         self.assertIn(no_capacity, html)
         self.assertEqual(self.digest(), before)
+        self.fixture.now += timedelta(seconds=1)
+        state["last_finished"] = self.fixture.now.isoformat()
+        pilot.atomic_json(state_path, state)
+        code, _, html = self.request()
+        self.assertEqual(code, 200)
+        self.assertNotIn("گزارش قدیمی یا ناقص", html)
+        self.assertNotIn(no_capacity, html)
 
     def test_sell_capacity_expires_even_while_report_is_fresh(self):
         self.fixture.enable_paper()
@@ -178,7 +189,7 @@ class DashboardTests(unittest.TestCase):
         before = self.digest()
         code, _, html = self.request()
         self.assertEqual(code, 503)
-        self.assertIn("گزارش این تاریخ در دسترس نیست", html)
+        self.assertIn("نسخهٔ قدیمی گزارش جدول قراردادها را ندارد", html)
         self.assertNotIn(str(self.root), html)
         self.assertEqual(self.digest(), before)
 

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--inventory", type=Path, help="write the collected pytest node IDs")
@@ -105,6 +106,35 @@ preflight = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", probe, boots
 if preflight.returncode:
     sys.stderr.write(preflight.stderr)
     sys.exit("Offline guard self-check failed")
+
+def replay_bootstrap(protected_path):
+    return (f"protected={str(protected_path)!r}\nchild=True\n" + bootstrap
+            + '\nimport runpy\nrunpy.run_path(sys.argv[1], run_name="__main__")\n')
+
+
+with TemporaryDirectory() as directory:
+    fixture_root = Path(directory)
+    protected_fixture = fixture_root / "protected"
+    protected_fixture.mkdir()
+    target = protected_fixture / "fixture.txt"
+    target.write_text("untouched", encoding="utf-8")
+    script = fixture_root / "replay_fixture.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "print('replay started', flush=True)\n"
+        "try:\n"
+        f"    Path({str(target)!r}).write_text('changed')\n"
+        "finally:\n"
+        "    print('replay continued', flush=True)\n", encoding="utf-8")
+    replay_probe = subprocess.run(
+        [sys.executable, "-I", "-S", "-B", "-c", replay_bootstrap(protected_fixture), str(script)],
+        capture_output=True, text=True, timeout=15)
+    if (replay_probe.returncode != 96 or replay_probe.stdout.strip() != "replay started"
+            or "OFFLINE GUARD BLOCKED open" not in replay_probe.stderr
+            or target.read_text(encoding="utf-8") != "untouched"):
+        sys.stderr.write(replay_probe.stderr)
+        sys.exit(f"Offline replay child self-check failed (exit {replay_probe.returncode})")
+print("OFFLINE_REPLAY_CHILD_SELF_CHECK passed", flush=True)
 print("OFFLINE_GUARD_SELF_CHECK passed", flush=True)
 
 exec(bootstrap)
@@ -119,8 +149,7 @@ class GuardedReplay(subprocess.Popen):
                 and not kw.get("shell") and not kw.get("executable")):
             deny("unexpected subprocess")
         type(self).total += 1
-        boot = (f"{protected=!r}\nchild=True\n" + bootstrap
-                + '\nimport runpy\nrunpy.run_path(sys.argv[1], run_name="__main__")\n')
+        boot = replay_bootstrap(protected)
         super().__init__([*args[:4], "-c", boot, args[4]], *pos, **kw)
 
     def communicate(self, *pos, **kw):

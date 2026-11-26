@@ -227,8 +227,11 @@ python -B run_offline_tests.py
 Use `python -B run_offline_tests.py --inventory /path/to/pytest-nodeids.txt`
 to save the sorted list of collected test IDs (not runtime subtests). CI
 publishes this file as the `pytest-nodeids` artifact for comparison across runs.
+CI logs added and removed IDs relative to the latest successful branch run
+(the target branch for pull requests), when its inventory is available.
 Before discovery, an isolated fixture checks that the guard rejects an external
-connect event and writes to a protected path while allowing loopback. The
+connect event and writes to a protected path while allowing loopback. Another
+fixture checks that a guarded replay child stops immediately on a blocked write. The
 separate browser check runs with Chrome or Chromium and stubbed scan responses:
 `python -B -m browser_tests.legacy_dashboard`.
 

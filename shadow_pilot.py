@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import timedelta
 import os
 from pathlib import Path
+import re
 import sqlite3
 from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfoNotFoundError
@@ -427,19 +428,47 @@ def status_for_root(root, now):
     return {"وضعیت": "گزارش قدیمی یا ناقص" if stale else state["result"], "سلامت": state}
 
 
+def inspect_archive(root, *, expected_count=None, expected_head=None):
+    if expected_count is not None or expected_head is not None:
+        watch.require(type(expected_count) is int and expected_count >= 0
+                      and isinstance(expected_head, str)
+                      and (expected_head == "empty" if expected_count == 0
+                           else re.fullmatch(r"[a-f0-9]{64}", expected_head)),
+                      "supply a nonnegative expected count and a matching-format head (or empty for count 0)")
+    stream = root / "observations"
+    verify_private_directory(root)
+    verify_private_directory(stream)
+    with collector.locked(stream, exclusive=False):
+        records = collector.read_stream(stream)
+    count = len(records)
+    head = records[-1]["head_sha256"] if records else "empty"
+    result = {"count": count, "head_sha256": head}
+    if expected_count is not None:
+        result["matches"] = count == expected_count and head == expected_head
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("tick", "check", "status"))
-    parser.add_argument("--config", required=True, type=Path)
+    commands = parser.add_subparsers(dest="action", required=True)
+    for action in ("tick", "check", "status"):
+        commands.add_parser(action).add_argument("--config", required=True, type=Path)
+    archive = commands.add_parser("verify-archive", help="read and optionally compare a sealed archive")
+    archive.add_argument("--root", required=True, type=Path)
+    archive.add_argument("--expected-count", type=int)
+    archive.add_argument("--expected-head")
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
-        result = status(args.config) if args.action == "status" else tick(args.config, dry_run=args.action == "check")
+        if args.action == "verify-archive":
+            result = inspect_archive(args.root, expected_count=args.expected_count, expected_head=args.expected_head)
+        else:
+            result = status(args.config) if args.action == "status" else tick(args.config, dry_run=args.action == "check")
     except (OSError, ValueError, ZoneInfoNotFoundError) as error:
         collector.log_event("pilot_failed", reason=str(error))
         return 1
     print(collector.json_bytes(result).decode(), end="")
-    return int(bool(result.get("هشدارهای عملیاتی")))
+    return int(result.get("matches") is False or bool(result.get("هشدارهای عملیاتی")))
 
 
 if __name__ == "__main__":

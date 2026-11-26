@@ -14,7 +14,7 @@ from market_data_quality import QUOTE_CLASSES
 from paper_quotes import TEHRAN, timestamp
 import shadow_collector as collector
 from shadow_pilot import REASONS, configuration, status_for_root, verify_private_directory
-from shadow_pilot_evidence import private_json
+from shadow_pilot_evidence import MissingPrivateFile, private_json
 import shadow_watch as watch
 
 
@@ -80,6 +80,10 @@ class Filters:
         return filters
 
 
+class LegacyReport(ValueError):
+    """A report published before the contract table was introduced."""
+
+
 def read_report(root, day, now):
     reports = root / "reports"
     verify_private_directory(root)
@@ -92,6 +96,9 @@ def read_report(root, day, now):
         raise ValueError("invalid report timestamp")
     observation = report["مشاهدات و غربال پژوهشی"]
     if observation is not None:
+        if (isinstance(observation, dict) and "قراردادها" not in observation
+                and {"آخرین ثبت", "پوشش"} <= observation.keys()):
+            raise LegacyReport
         records = observation["قراردادها"]
         receipt = observation["آخرین ثبت"]
         if not isinstance(records, dict) or (bool(records) != (receipt is not None)):
@@ -295,6 +302,14 @@ class PilotHandler(BaseHTTPRequestHandler):
         if body and self.command != "HEAD":
             self.wfile.write(body)
 
+    def unavailable(self, message, health, filters, today):
+        status = health["وضعیت"]
+        body = document(
+            f'<p class="pilot-alert">{h(message)} وضعیت فعلی زمان‌بندی {h(HEALTH.get(status, status))} است.</p>'
+            + filters_form(filters, today)
+        )
+        return self.respond(503, body)
+
     def do_GET(self):
         if (self.headers.get_all("Host") != [self.server.authority]
                 or self.headers.get_all("Origin") not in (None, [f"http://{self.server.authority}"])
@@ -318,12 +333,12 @@ class PilotHandler(BaseHTTPRequestHandler):
         try:
             report, generated = read_report(self.server.root, filters.day, now)
             body = dashboard(report, generated, health, filters, now, today)
+        except (MissingPrivateFile, FileNotFoundError):
+            return self.unavailable("گزارش این تاریخ هنوز منتشر نشده است.", health, filters, today)
+        except LegacyReport:
+            return self.unavailable("نسخهٔ قدیمی گزارش جدول قراردادها را ندارد.", health, filters, today)
         except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
-            body = document(
-                f'<p class="pilot-alert">گزارش این تاریخ در دسترس نیست. وضعیت فعلی زمان‌بندی {h(HEALTH.get(health["وضعیت"], health["وضعیت"]))} است.</p>'
-                + filters_form(filters, today)
-            )
-            return self.respond(503, body)
+            return self.unavailable("گزارش این تاریخ نامعتبر است.", health, filters, today)
         self.respond(200, body)
 
     do_HEAD = do_GET

@@ -14,11 +14,15 @@ from shadow_watch import invalid_constant, unique_object
 MAX_FEED = 2 * 1024 * 1024
 
 
+class MissingPrivateFile(ValueError):
+    """A required private file has not been published."""
+
+
 def private_bytes(path, limit):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError as error:
-        raise ValueError(f"required private file is missing: {path.name}") from error
+        raise MissingPrivateFile(f"required private file is missing: {path.name}") from error
     with os.fdopen(fd, "rb") as stream:
         mode = os.fstat(stream.fileno())
         if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o077:

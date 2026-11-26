@@ -1,9 +1,12 @@
 """Deterministic pilot tests with temporary ledgers and synthetic HTTP bodies."""
 
+from contextlib import redirect_stdout
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
+from io import StringIO
+import json
 from pathlib import Path
 from shutil import copytree
 from tempfile import TemporaryDirectory
@@ -145,6 +148,19 @@ class PilotTests(unittest.TestCase):
         backup = self.root / "backup"
         copytree(self.output, backup)
         self.assertEqual(seal_heads(backup), expected_heads)
+
+        def verify_cli(root):
+            out = StringIO()
+            with patch("shadow_pilot.os.umask"), redirect_stdout(out):
+                status = pilot.main(["verify-archive", "--root", str(root), "--expected-count", "2",
+                                     "--expected-head", expected_heads[-1]])
+            return status, json.loads(out.getvalue())
+
+        self.assertEqual(verify_cli(backup), (0, {"count": 2, "head_sha256": expected_heads[-1], "matches": True}))
+        truncated = self.root / "truncated"
+        copytree(backup, truncated)
+        (truncated / "observations" / "00000002").rename(truncated / "unsealed-outside-stream")
+        self.assertEqual(verify_cli(truncated), (1, {"count": 1, "head_sha256": expected_heads[0], "matches": False}))
 
         damaged = self.root / "damaged"
         copytree(backup, damaged)

@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   tests:
     runs-on: ubuntu-24.04
@@ -28,3 +29,29 @@ jobs:
           if-no-files-found: error
       - name: Check legacy dashboard in headless Chrome
         run: python -B -m browser_tests.legacy_dashboard
+      - name: Compare collected tests with the last successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_BRANCH: ${{ github.base_ref || github.ref_name }}
+          LC_ALL: C
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow offline-tests.yml \
+            --branch "$BASELINE_BRANCH" --status success --limit 30 --json databaseId,number,event \
+            --jq "map(select(.number < $GITHUB_RUN_NUMBER and .event != \"pull_request\")) | first | .databaseId // empty")
+          if [[ -z "$run" ]]; then
+            echo 'Test inventory comparison: no previous successful branch run.' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=pytest-nodeids" \
+            --jq '.artifacts[] | select(.expired == false) | .id')
+          if [[ -z "$artifact" ]]; then
+            echo "Test inventory comparison: run $run has no available inventory." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          baseline=$(mktemp -d "$RUNNER_TEMP/inventory-baseline.XXXXXX")
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name pytest-nodeids --dir "$baseline"
+          comm --check-order -13 "$baseline/pytest-nodeids.txt" "$RUNNER_TEMP/pytest-nodeids.txt" > "$baseline/added"
+          comm --check-order -23 "$baseline/pytest-nodeids.txt" "$RUNNER_TEMP/pytest-nodeids.txt" > "$baseline/removed"
+          echo "Test inventory vs run $run: $(wc -l < "$baseline/added") added, $(wc -l < "$baseline/removed") removed." | tee -a "$GITHUB_STEP_SUMMARY"
+          sed 's/^/Added: /' "$baseline/added"
+          sed 's/^/Removed: /' "$baseline/removed"
