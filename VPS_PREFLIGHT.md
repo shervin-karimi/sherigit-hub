@@ -10,6 +10,7 @@ TSETMC request is made. It performs **no** network calls, writes no files, runs 
 python -B vps_preflight.py \
   --config /absolute/path/to/pilot.json \
   --unit /absolute/path/to/pilot.service \
+  --requirements requirements-test.txt \
   --min-free-mb 50
 ```
 
@@ -22,6 +23,7 @@ produces a stable JSON object with `"وضعیت": "issues"` and exit status `1`.
 | --- | --- | --- |
 | `python` | Running interpreter 3.12 or newer | Python 3.11 on the host |
 | `tehran_timezone` | `Asia/Tehran` tzdata available with UTC+03:30 | Missing `tzdata`, wrong offset |
+| `dependencies` | Every `name==version` pin in `--requirements` matches the installed distribution; no network access | Drifted dev environment, missing package, unsupported pin syntax |
 | `files` | Private root (`0700`, owner), private config/calendar/paper files (`0600`), valid windows and interval | Symlink, group-readable file, overlapping windows |
 | `disk` | Free space at least `--min-free-mb` (default 50 MiB) | Full volume |
 | `calendar` | Non-empty dated sessions with valid Tehran-time intervals | Malformed or empty calendar |
@@ -29,7 +31,13 @@ produces a stable JSON object with `"وضعیت": "issues"` and exit status `1`.
 
 A missing `TZ` environment variable is only a warning: the application always
 uses `ZoneInfo("Asia/Tehran")` explicitly. The unit file is parsed as text; it is
-not installed, enabled or started.
+not installed, enabled or started. `--requirements` defaults to the repository's
+`requirements-test.txt`; the check uses `importlib.metadata` only and never
+contacts a package index. A drifted local development virtualenv is reported as
+an issue rather than silently accepted.
+
+For the operator actions that follow a failed preflight or a 503 report, see
+[SHADOW_PILOT.md — Operator troubleshooting](SHADOW_PILOT.md#operator-troubleshooting).
 
 ## Example unit (not activated by the tool)
 
@@ -54,6 +62,8 @@ The preflight tool never performs that step.
 ## Remediation
 
 - Install `tzdata` and Python 3.12+ before retrying.
+- Install exactly the pinned test dependencies with
+  `python -m pip install -r requirements-test.txt` and re-run the preflight.
 - Create the pilot root with mode `0700` and private files with mode `0600`.
 - Use absolute paths in both the configuration and the unit file.
 - Restore a valid trading calendar from the reviewed local copy; never fabricate sessions.

@@ -52,12 +52,12 @@ def pilot_server(root):
         thread.join(3)
 
 
-def fetch_page(server, path="/"):
+def fetch_page(server, path="/", *, method="GET", headers=None):
     client = HTTPConnection(HOST, server.server_port, timeout=5)
     try:
-        client.request("GET", path)
+        client.request(method, path, headers=headers or {})
         response = client.getresponse()
-        return response.status, response.read().decode("utf-8")
+        return response.status, response.read().decode("utf-8"), dict(response.getheaders())
     finally:
         client.close()
 
@@ -149,7 +149,7 @@ def check_pilot_503(chrome, scenario):
         if report is not None:
             atomic_json(root / "reports" / f"{DAY}.json", report)
         with pilot_server(root) as server:
-            status, html = fetch_page(server, "/")
+            status, html, _ = fetch_page(server, "/")
         if status != 503:
             raise SystemExit(f"Pilot 503 ({scenario}) returned {status}")
         page = Path(temporary) / f"pilot-503-{scenario}.html"
@@ -179,7 +179,7 @@ def check_pilot_success(chrome):
         atomic_json(root / "reports" / f"{DAY}.json", build_success_report())
         with pilot_server(root) as server:
             for name, path, expected, forbidden in cases:
-                status, html = fetch_page(server, path)
+                status, html, _ = fetch_page(server, path)
                 if status != 200:
                     raise SystemExit(f"Pilot success ({name}) returned {status}")
                 page = Path(temporary) / f"pilot-200-{name}.html"
@@ -194,10 +194,39 @@ def check_pilot_success(chrome):
     print("PILOT_200_FILTERS_BROWSER_CHECK passed")
 
 
+def check_pilot_security(chrome):
+    """Render real 403 and 405 responses from the loopback pilot server."""
+    cases = (
+        ("403", "GET", "/", {"Origin": "http://evil.invalid"}, 403, None,
+         "مبدأ یا میزبان درخواست معتبر نیست."),
+        ("405", "POST", "/", {}, 405, "GET, HEAD", None),
+    )
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary) / "pilot"
+        private_directory(root)
+        atomic_json(root / "state.json", load_state(root / "state.json"))
+        with pilot_server(root) as server:
+            for name, method, path, headers, expected_status, allow, expected_text in cases:
+                status, html, response_headers = fetch_page(
+                    server, path, method=method, headers=headers)
+                if status != expected_status:
+                    raise SystemExit(f"Pilot security ({name}) returned {status}")
+                if allow and response_headers.get("Allow") != allow:
+                    raise SystemExit(f"Pilot security ({name}) Allow header was "
+                                     f"{response_headers.get('Allow')!r}")
+                page = Path(temporary) / f"pilot-{name}.html"
+                page.write_text(html, encoding="utf-8")
+                result = render_chrome(chrome, page, Path(temporary) / f"pilot-profile-{name}")
+                if result.returncode or (expected_text and expected_text not in result.stdout):
+                    raise SystemExit(f"Pilot security ({name}) browser check failed "
+                                     f"({result.returncode}):\n{result.stdout}\n{result.stderr}")
+    print("PILOT_SECURITY_BROWSER_CHECK passed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chrome", default=shutil.which("google-chrome") or shutil.which("chromium"))
-    parser.add_argument("--check", choices=("all", "legacy", "success", "pilot"), default="all")
+    parser.add_argument("--check", choices=("all", "legacy", "success", "security", "pilot"), default="all")
     args = parser.parse_args()
     if not args.chrome:
         parser.error("Chrome or Chromium is required (or pass --chrome PATH)")
@@ -219,6 +248,8 @@ def main():
         print("LEGACY_DASHBOARD_BROWSER_CHECK passed")
     if args.check in ("all", "success"):
         check_pilot_success(args.chrome)
+    if args.check in ("all", "security"):
+        check_pilot_security(args.chrome)
     if args.check in ("all", "pilot"):
         for scenario in PILOT_SCENARIOS:
             check_pilot_503(args.chrome, scenario)

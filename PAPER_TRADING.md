@@ -236,20 +236,27 @@ baseline exemption in the same file. Actions pinned to major v7 run on Node.js 2
 Before discovery, an isolated fixture checks that the guard rejects an external
 connect event and writes to a protected path while allowing loopback. Another
 fixture checks that guarded replay children stop immediately on a blocked write,
-external connect or DNS lookup event. CI runs the suite and every browser check
-under `umask 022` so tests cannot depend on a permissive local default. The
-browser checks use Chrome or Chromium with stubbed scan responses, a successful
-HTTP 200 page with search/side/status/pagination filters, and real pilot 503
-pages for missing, legacy and invalid reports. Each browser check is an
-independent CI step with `if: ${{ !cancelled() }}`, and its result is appended to
-`GITHUB_STEP_SUMMARY`. Locally: `python -B -m browser_tests.legacy_dashboard
---check legacy|success|pilot` (omit `--check` to run all checks).
+external connect, external `socket.sendto` or DNS lookup event. CI runs the suite
+and every browser check under `umask 022` so tests cannot depend on a permissive
+local default. The browser checks use Chrome or Chromium with stubbed scan
+responses, a successful HTTP 200 page with search/side/status/pagination filters,
+real 403/405 security responses and real pilot 503 pages for missing, legacy and
+invalid reports. Each browser check is an independent CI step with
+`if: ${{ !cancelled() }}`, and its result is appended to `GITHUB_STEP_SUMMARY`.
+The offline-test step also appends the Python version, passed test count, passed
+subtest count and `OFFLINE_GUARD_ATTEMPTS` to the same summary. Locally:
+`python -B -m browser_tests.legacy_dashboard
+--check legacy|success|security|pilot` (omit `--check` to run all checks).
 
 For deployment preparation without any live request or service activation, run
-`python -B vps_preflight.py --config … --unit …` as described in
-`VPS_PREFLIGHT.md`. The staged plan for any future real-data work, including
-Greeks/IV evidence and paper-only P&L review, is in `REAL_DATA_OPERATIONS.md`;
-it requires separate explicit approval before collection or scheduling.
+`python -B vps_preflight.py --config … --unit … --requirements requirements-test.txt`
+as described in `VPS_PREFLIGHT.md`; its dependency check is offline and reports
+drifted virtualenvs instead of contacting a package index. Operator actions for
+503 pages and failed archive verification are summarized in
+`SHADOW_PILOT.md#operator-troubleshooting`. The staged plan for any future
+real-data work, including Greeks/IV evidence and paper-only P&L review, is in
+`REAL_DATA_OPERATIONS.md`; it requires separate explicit approval before
+collection or scheduling.
 
 The three TSETMC diagnostic scripts run their requests only when executed
 directly. Test discovery imports them without contacting TSETMC. The

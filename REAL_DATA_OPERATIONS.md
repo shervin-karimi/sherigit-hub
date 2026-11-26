@@ -24,7 +24,8 @@ G7 جزو این برنامه نیست و نباید توسط ابزار پیش�
 
 1. **پیشبررسی استقرار**
    ```sh
-   python -B vps_preflight.py --config /path/pilot.json --unit /path/pilot.service
+   python -B vps_preflight.py --config /path/pilot.json --unit /path/pilot.service \
+     --requirements requirements-test.txt
    ```
    سرویس را فعال نکنید؛ ابزار فقط فایل unit را بررسی میکند.
 

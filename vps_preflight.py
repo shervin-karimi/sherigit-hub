@@ -2,9 +2,11 @@
 
 import argparse
 from datetime import datetime, timedelta
+from importlib import metadata
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -17,6 +19,11 @@ from shadow_pilot import configuration, verify_private_directory
 MIN_PYTHON = (3, 12)
 MAX_UNIT_BYTES = 64 * 1024
 TEHRAN_OFFSET = timedelta(hours=3, minutes=30)
+PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.*+!_-]*)$")
+
+
+def canonical_name(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def check_python(version):
@@ -39,6 +46,33 @@ def check_timezone(now=None):
     if os.environ.get("TZ") not in ("Asia/Tehran", ":Asia/Tehran"):
         warnings.append("متغیر TZ تنظیم نشده است؛ برنامه صریحاً از ZoneInfo استفاده میکند.")
     return check, warnings
+
+
+def check_dependencies(path):
+    """Compare installed distributions with an offline pinned manifest."""
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("dependency manifest is missing or unsafe")
+    pins = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        match = PIN.fullmatch(line)
+        if not match:
+            raise ValueError(f"invalid dependency pin on line {number}")
+        pins.append((match.group(1), match.group(2)))
+    if not pins:
+        raise ValueError("dependency manifest has no pins")
+    installed = {}
+    for distribution in metadata.distributions():
+        name = distribution.metadata.get("Name")
+        if name:
+            installed[canonical_name(name)] = distribution.version
+    mismatches = [{"بسته": name, "لازم": required,
+                   "نصبشده": installed.get(canonical_name(name))}
+                  for name, required in pins if installed.get(canonical_name(name)) != required]
+    return {"وضعیت": "ok" if not mismatches else "خطا", "فایل": path.name,
+            "تعداد": len(pins), "عدم_تطابق": mismatches}
 
 
 def private_file(path):
@@ -111,6 +145,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--unit", type=Path, required=True)
+    parser.add_argument("--requirements", type=Path,
+                        default=Path(__file__).resolve().with_name("requirements-test.txt"))
     parser.add_argument("--min-free-mb", type=int, default=50)
     args = parser.parse_args(argv)
     checks, warnings = {}, []
@@ -118,6 +154,7 @@ def main(argv=None):
         checks["python"] = check_python(sys.version_info)
         checks["tehran_timezone"], extra = check_timezone()
         warnings.extend(extra)
+        checks["dependencies"] = check_dependencies(args.requirements)
         checks["files"], (root, calendar, windows) = check_files(args.config)
         checks["disk"] = check_disk(root, args.min_free_mb)
         checks["calendar"] = check_calendar(calendar, windows)

@@ -151,6 +151,14 @@ replay_child_check(
     "print('replay continued', flush=True)\n",
     "socket.connect", "CONNECT")
 replay_child_check(
+    "import socket, sys\n"
+    "print('replay started', flush=True)\n"
+    "with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:\n"
+    "    connection.bind(('127.0.0.1', 0))\n"
+    "    sys.audit('socket.sendto', connection, ('192.0.2.1', 443))\n"
+    "print('replay continued', flush=True)\n",
+    "socket.sendto", "SENDTO")
+replay_child_check(
     "import sys\n"
     "print('replay started', flush=True)\n"
     "sys.audit('socket.getaddrinfo', 'example.invalid', 443)\n"

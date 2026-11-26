@@ -182,16 +182,23 @@ updated pilot complete a tick to publish today's compatible report. Keep
 historical reports in private storage. The dashboard does not rewrite them
 or read raw archive bodies to reconstruct them.
 
-When a report cannot be shown, the 503 page names the cause and one action:
+### Operator troubleshooting
+
+When a report cannot be shown, the 503 page names the cause and one action.
+The same table also covers the stable `verify-archive` failure output described
+in the restore drill above:
 
 | Message shown | Operator action |
 | --- | --- |
 | `گزارش این تاریخ هنوز منتشر نشده است.` | Wait for the next scheduled tick; check the timer, service and journal. |
 | `نسخهٔ قدیمی گزارش جدول قراردادها را ندارد.` | Let the updated pilot publish one complete tick; never edit an old report. |
 | `گزارش این تاریخ نامعتبر است.` | Do not modify the file; check private directory ownership and modes, then restore from backup if needed. |
+| `{"error": "archive verification failed"}` | Keep the archive untouched. Compare the recorded count and head with the private backup, restore to an unused staging path, then re-run `verify-archive` before resuming. |
 
 The `اقدام` guidance shown on the 503 page comes from `REPORT_GUIDANCE` in
 `shadow_pilot_dashboard.py`. Treat a 503 as unavailable data, never as a signal.
+The `verify-archive` error is intentionally stable: paths and raw exceptions stay
+in the private journal and are never printed to the operator console.
 
 ```sh
 install -m 644 deploy/shadow-pilot-dashboard.service ~/.config/systemd/user/
