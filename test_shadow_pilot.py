@@ -165,7 +165,8 @@ class PilotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pilot.inspect_archive(backup, expected_count=2, expected_head="not-a-hash")
         empty_root = self.root / "empty-archive"
-        (empty_root / "observations").mkdir(mode=0o700, parents=True)
+        pilot.private_directory(empty_root)
+        pilot.private_directory(empty_root / "observations")
         self.assertEqual(pilot.inspect_archive(empty_root), {"count": 0, "head_sha256": "empty"})
         out = StringIO()
         with patch("shadow_pilot.os.umask"), redirect_stdout(out):
