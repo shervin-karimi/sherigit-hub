@@ -1,6 +1,13 @@
 {
   "version": 1,
-  "removals": [],
+  "removals": [
+    {
+      "nodeid": "test_inventory_compare.py::InventoryComparisonTests::test_cli_reports_both_directions",
+      "reason": "Renamed to test_cli_reports_both_directions_and_fails_on_unapproved_removal to cover the new removal gate; the original assertions are retained.",
+      "approved_by": "project owner",
+      "date": "2026-11-26"
+    }
+  ],
   "baseline_exemptions": [
     {
       "run": "none",
