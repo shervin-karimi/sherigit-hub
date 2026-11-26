@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -75,21 +76,39 @@ def check_dependencies(path):
             "تعداد": len(pins), "عدم_تطابق": mismatches}
 
 
-def private_file(path):
-    info = path.lstat()
-    if (not path.is_file() or path.is_symlink() or info.st_uid != os.getuid()
-            or info.st_mode & 0o077):
-        raise ValueError(f"file must be private and owned by the pilot user: {path.name}")
+def private_file(path, *, optional=False, mode=None):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return False
+        raise ValueError(f"required private file is missing: {path.name}") from None
+    permissions = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or permissions & 0o077:
+        raise ValueError(f"file must be regular, private and owned by the pilot user: {path.name}")
+    if mode is not None and permissions != mode:
+        raise ValueError(f"file must have mode {mode:04o}: {path.name}")
+    return True
+
+
+def check_sqlite(path):
+    """Validate the configured ledger and any existing SQLite sidecars without opening them."""
+    private_file(path, mode=0o600)
+    return [suffix for suffix in ("-wal", "-shm", "-journal")
+            if private_file(path.with_name(path.name + suffix), optional=True, mode=0o600)]
 
 
 def check_files(config):
     root, calendar, windows, gap, paper = configuration(config)
     verify_private_directory(root)
     private_file(calendar)
-    for path in (paper or {}).values():
-        private_file(path)
     check = {"وضعیت": "ok", "پنجرهها": len(schedule.intervals(windows)),
              "فاصله_ثانیه": gap, "دفتر_مستقل": paper is not None}
+    if paper is not None:
+        for name, path in paper.items():
+            if name != "db":
+                private_file(path)
+        check["sqlite"] = {"فایل": paper["db"].name, "فایلهای_جانبی": check_sqlite(paper["db"])}
     return check, (root, calendar, windows)
 
 

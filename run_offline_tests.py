@@ -124,11 +124,13 @@ def replay_child_check(source, expected_event, label):
         result = subprocess.run(
             [sys.executable, "-I", "-S", "-B", "-c", replay_bootstrap(protected_fixture), str(script)],
             capture_output=True, text=True, timeout=15)
-        unchanged = target.read_text(encoding="utf-8") == "untouched"
+        unchanged = target.is_file() and target.read_text(encoding="utf-8") == "untouched"
+        no_unexpected_files = set(protected_fixture.iterdir()) == {target}
+        destination_missing = not (fixture_root / "renamed.txt").exists()
     if (result.returncode != 96 or result.stdout.strip() != "replay started"
             or "replay continued" in result.stdout
             or f"OFFLINE GUARD BLOCKED {expected_event}" not in result.stderr
-            or not unchanged):
+            or not unchanged or not no_unexpected_files or not destination_missing):
         sys.stderr.write(result.stderr)
         sys.exit(f"Offline replay child self-check ({label}) failed (exit {result.returncode})")
     print(f"OFFLINE_REPLAY_{label}_CHILD_SELF_CHECK passed", flush=True)
@@ -158,6 +160,34 @@ replay_child_check(
     "    sys.audit('socket.sendto', connection, ('192.0.2.1', 443))\n"
     "print('replay continued', flush=True)\n",
     "socket.sendto", "SENDTO")
+replay_child_check(
+    "import socket, sys\n"
+    "print('replay started', flush=True)\n"
+    "with socket.socket() as connection:\n"
+    "    sys.audit('socket.bind', connection, ('0.0.0.0', 0))\n"
+    "print('replay continued', flush=True)\n",
+    "socket.bind", "BIND")
+replay_child_check(
+    "import os\nfrom pathlib import Path\n"
+    "print('replay started', flush=True)\n"
+    "os.rename(__TARGET__, Path(__TARGET__).parent.parent / 'renamed.txt')\n"
+    "print('replay continued', flush=True)\n",
+    "os.rename", "RENAME_FROM_PROTECTED")
+replay_child_check(
+    "import os\nfrom pathlib import Path\n"
+    "print('replay started', flush=True)\n"
+    "target = Path(__TARGET__)\n"
+    "source = target.parent.parent / 'source.txt'\n"
+    "source.write_text('unprotected')\n"
+    "os.rename(source, target.with_name('renamed.txt'))\n"
+    "print('replay continued', flush=True)\n",
+    "os.rename", "RENAME_INTO_PROTECTED")
+replay_child_check(
+    "import os\n"
+    "print('replay started', flush=True)\n"
+    "os.remove(__TARGET__)\n"
+    "print('replay continued', flush=True)\n",
+    "os.remove", "REMOVE")
 replay_child_check(
     "import sys\n"
     "print('replay started', flush=True)\n"

@@ -24,7 +24,7 @@ produces a stable JSON object with `"وضعیت": "issues"` and exit status `1`.
 | `python` | Running interpreter 3.12 or newer | Python 3.11 on the host |
 | `tehran_timezone` | `Asia/Tehran` tzdata available with UTC+03:30 | Missing `tzdata`, wrong offset |
 | `dependencies` | Every `name==version` pin in `--requirements` matches the installed distribution; no network access | Drifted dev environment, missing package, unsupported pin syntax |
-| `files` | Private root (`0700`, owner), private config/calendar/paper files (`0600`), valid windows and interval | Symlink, group-readable file, overlapping windows |
+| `files` | Private root, config, calendar and paper files, valid windows and interval. When `paper` is configured, the ledger and any existing `-wal`, `-shm` or `-journal` must be regular files owned by the pilot user with mode `0600`. | Missing ledger, symlink, wrong owner, group-readable sidecar, overlapping windows |
 | `disk` | Free space at least `--min-free-mb` (default 50 MiB) | Full volume |
 | `calendar` | Non-empty dated sessions with valid Tehran-time intervals | Malformed or empty calendar |
 | `systemd` | Unit has non-root `User`, matching `WorkingDirectory`, `ExecStart` with `--config`, `Environment=TZ=Asia/Tehran`, and `[Install] WantedBy` | Wrong user, missing install target |
@@ -35,6 +35,10 @@ not installed, enabled or started. `--requirements` defaults to the repository's
 `requirements-test.txt`; the check uses `importlib.metadata` only and never
 contacts a package index. A drifted local development virtualenv is reported as
 an issue rather than silently accepted.
+
+Run preflight as the intended pilot user: the file ownership checks compare
+against the invoking UID. SQLite checks use file metadata only and report which
+sidecars exist; they do not open the database or require sidecars to exist.
 
 For the operator actions that follow a failed preflight or a 503 report, see
 [SHADOW_PILOT.md — Operator troubleshooting](SHADOW_PILOT.md#operator-troubleshooting).

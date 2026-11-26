@@ -195,10 +195,14 @@ def check_pilot_success(chrome):
 
 
 def check_pilot_security(chrome):
-    """Render real 403 and 405 responses from the loopback pilot server."""
+    """Render real 400, 403, 404 and 405 responses from the loopback pilot server."""
     cases = (
+        ("400", "GET", "/?page=invalid", {}, 400, None,
+         "پارامتر گزارش نامعتبر است."),
         ("403", "GET", "/", {"Origin": "http://evil.invalid"}, 403, None,
          "مبدأ یا میزبان درخواست معتبر نیست."),
+        ("404", "GET", "/missing-page", {}, 404, None,
+         "صفحه پیدا نشد."),
         ("405", "POST", "/", {}, 405, "GET, HEAD", None),
     )
     with TemporaryDirectory() as temporary:
@@ -220,6 +224,7 @@ def check_pilot_security(chrome):
                 if result.returncode or (expected_text and expected_text not in result.stdout):
                     raise SystemExit(f"Pilot security ({name}) browser check failed "
                                      f"({result.returncode}):\n{result.stdout}\n{result.stderr}")
+                print(f"PILOT_{name}_BROWSER_CHECK passed")
     print("PILOT_SECURITY_BROWSER_CHECK passed")
 
 

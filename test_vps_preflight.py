@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from importlib import metadata
 from io import StringIO
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -118,6 +119,52 @@ class VPSPreflightTests(unittest.TestCase):
         code, result = self.run_preflight(config, unit, requirements)
         self.assertEqual(code, 1)
         self.assertEqual(result["وضعیت"], "issues")
+
+    def test_sqlite_metadata_report_is_read_only_and_sidecars_are_optional(self):
+        config, unit, _, requirements = self.fixture()
+        data = json.loads(config.read_text(encoding="utf-8"))
+        paths = {name: self.root / name for name in pilot.PAPER_FIELDS}
+        for path in paths.values():
+            path.touch(mode=0o600)
+        data["paper"] = {name: str(path) for name, path in paths.items()}
+        pilot.atomic_json(config, data)
+        wal = paths["db"].with_name("db-wal")
+        wal.touch(mode=0o600)
+        before = {path.name: (path.read_bytes(), path.stat().st_mode)
+                  for path in self.root.iterdir() if path.is_file()}
+        code, result = self.run_preflight(config, unit, requirements)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["بررسیها"]["files"]["sqlite"],
+                         {"فایل": "db", "فایلهای_جانبی": ["-wal"]})
+        after = {path.name: (path.read_bytes(), path.stat().st_mode)
+                 for path in self.root.iterdir() if path.is_file()}
+        self.assertEqual(after, before)
+
+    def test_sqlite_requires_private_read_write_mode_on_db_and_sidecars(self):
+        db = self.root / "ledger.sqlite3"
+        with self.assertRaisesRegex(ValueError, "missing.*ledger.sqlite3"):
+            preflight.check_sqlite(db)
+        db.touch(mode=0o600)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            path = db.with_name(db.name + suffix)
+            path.touch(mode=0o600)
+            for mode in (0o640, 0o400):
+                with self.subTest(suffix=suffix, mode=mode):
+                    path.chmod(mode)
+                    with self.assertRaisesRegex(ValueError, path.name):
+                        preflight.check_sqlite(db)
+            path.chmod(0o600)
+
+    def test_sqlite_rejects_wrong_owner_and_dangling_sidecar_symlink(self):
+        db = self.root / "ledger.sqlite3"
+        db.touch(mode=0o600)
+        with patch.object(preflight.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(ValueError, "owned by the pilot user"):
+                preflight.check_sqlite(db)
+        wal = db.with_name(db.name + "-wal")
+        wal.symlink_to(self.root / "missing")
+        with self.assertRaisesRegex(ValueError, "regular.*ledger.sqlite3-wal"):
+            preflight.check_sqlite(db)
 
 
 if __name__ == "__main__":
