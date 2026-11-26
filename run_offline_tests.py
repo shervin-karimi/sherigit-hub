@@ -150,6 +150,12 @@ replay_child_check(
     "    sys.audit('socket.connect', connection, ('192.0.2.1', 443))\n"
     "print('replay continued', flush=True)\n",
     "socket.connect", "CONNECT")
+replay_child_check(
+    "import sys\n"
+    "print('replay started', flush=True)\n"
+    "sys.audit('socket.getaddrinfo', 'example.invalid', 443)\n"
+    "print('replay continued', flush=True)\n",
+    "socket.getaddrinfo", "DNS")
 print("OFFLINE_GUARD_SELF_CHECK passed", flush=True)
 
 exec(bootstrap)

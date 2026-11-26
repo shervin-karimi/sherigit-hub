@@ -214,7 +214,7 @@ Offline tests: `python -B -m unittest -v test_paper_trading`
 
 ## Repeatable offline tests
 
-CI uses Python 3.12 and the pinned packages in `requirements-test.txt`.
+CI uses a Python 3.12/3.13 matrix and the pinned packages in `requirements-test.txt`.
 The test runner installs the network and data-write guards before pytest
 discovery. Loopback HTTP is allowed for local dashboard tests. Replay
 subprocesses run with the same guards.
@@ -226,17 +226,20 @@ python -B run_offline_tests.py
 
 Use `python -B run_offline_tests.py --inventory /path/to/pytest-nodeids.txt`
 to save the sorted list of collected test IDs (not runtime subtests). CI
-publishes this file as the `pytest-nodeids` artifact for comparison across runs.
+publishes this file as the `pytest-nodeids-<python-version>` artifact for comparison across runs.
 CI logs added and removed IDs relative to the latest successful branch run
 (the target branch for pull requests), when its inventory is available, using
 `compare_inventories.py`. Actions pinned to major v7 run on Node.js 24.
 Before discovery, an isolated fixture checks that the guard rejects an external
 connect event and writes to a protected path while allowing loopback. Another
-fixture checks that guarded replay children stop immediately on a blocked write
-or an external connect event. CI runs the suite under `umask 022` so tests cannot
-depend on a permissive local default. The separate browser check runs with Chrome
-or Chromium and stubbed scan responses plus a real pilot 503 page:
-`python -B -m browser_tests.legacy_dashboard`.
+fixture checks that guarded replay children stop immediately on a blocked write,
+external connect or DNS lookup event. CI runs the suite and both browser checks
+under `umask 022` so tests cannot depend on a permissive local default. The
+browser checks use Chrome or Chromium with stubbed scan responses and real pilot
+503 pages for missing, legacy and invalid reports; CI runs them as separate
+steps: `python -B -m browser_tests.legacy_dashboard --check legacy` and
+`python -B -m browser_tests.legacy_dashboard --check pilot` (omit `--check` to
+run all checks locally).
 
 The three TSETMC diagnostic scripts run their requests only when executed
 directly. Test discovery imports them without contacting TSETMC. The

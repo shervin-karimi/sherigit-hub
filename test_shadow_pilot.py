@@ -19,6 +19,7 @@ from paper_quotes import load_catalog
 from paper_trading import PaperTrading
 import shadow_collector as collector
 import shadow_pilot as pilot
+from shadow_pilot_dashboard import read_report
 import shadow_watch as watch
 from test_shadow_collection import APPEND, READ_STREAM, body
 
@@ -237,6 +238,8 @@ class PilotTests(unittest.TestCase):
         self.assertEqual((state["last_sequence"], state["last_claimed"]), (1, 1))
         self.assertEqual(state["paper_scope"][2], str(self.paths["db"].resolve()))
         batch = (self.output / "trusted-batches" / "0000000000000000001.json").read_bytes()
+        archive = pilot.inspect_archive(self.output)
+        self.assertGreaterEqual(archive["count"], 1)
 
         suffix = ("-wal", "-shm", "-journal")
         def copy_ledger(directory, name="paper.sqlite3"):
@@ -271,15 +274,25 @@ class PilotTests(unittest.TestCase):
         broken.update(last_sequence=0, last_claimed=0)
         pilot.atomic_json(state_path, broken)
         (self.output / "trusted-batches" / "0000000000000000001.json").unlink()
+        (self.output / "observations" / "00000001").rename(
+            self.output / "observations" / "00000042")
         self.assertEqual(pilot.load_state(state_path)["last_sequence"], 0)
         self.assertFalse((self.output / "trusted-batches" / "0000000000000000001.json").exists())
+        with self.assertRaises(watch.ArchiveError):
+            pilot.inspect_archive(self.output)
 
         self.output.rename(self.root / "pre-restore")
         copytree(backup / "pilot", self.output)
         restore_ledger(backup)
         self.assertEqual(self.ledger.history(), history)
         self.assertEqual((self.output / "trusted-batches" / "0000000000000000001.json").read_bytes(), batch)
+        restored = pilot.inspect_archive(self.output, expected_count=archive["count"],
+                                         expected_head=archive["head_sha256"])
+        self.assertTrue(restored["matches"])
         self.assertEqual(pilot.status(self.config)["وضعیت"], "ok")
+        report, generated = read_report(self.output, "2026-11-22", self.now)
+        self.assertTrue(report)
+        self.assertLessEqual(generated, self.now)
         self.assertIn("already processed", self.report()["دفتر آزمایشی"]["مانع"])
         self.assertEqual(self.ledger.history(), history)
         self.sign(2, entries=[("restore-entry-2", 1)])

@@ -8,6 +8,10 @@ permissions:
   actions: read
 jobs:
   tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -16,7 +20,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements-test.txt
       - run: python -m pip install -r requirements-test.txt
@@ -24,15 +28,18 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: pytest-nodeids
+          name: pytest-nodeids-${{ matrix.python-version }}
           path: ${{ runner.temp }}/pytest-nodeids.txt
           if-no-files-found: error
       - name: Check legacy dashboard in headless Chrome
-        run: python -B -m browser_tests.legacy_dashboard
+        run: umask 022 && python -B -m browser_tests.legacy_dashboard --check legacy
+      - name: Check pilot 503 pages in headless Chrome
+        run: umask 022 && python -B -m browser_tests.legacy_dashboard --check pilot
       - name: Compare collected tests with the last successful run
         env:
           GH_TOKEN: ${{ github.token }}
           BASELINE_BRANCH: ${{ github.base_ref || github.ref_name }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
           LC_ALL: C
         run: |
           run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow offline-tests.yml \
@@ -42,15 +49,15 @@ jobs:
             echo 'Test inventory comparison: no previous successful branch run.' | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=pytest-nodeids" \
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?name=pytest-nodeids-$PYTHON_VERSION" \
             --jq '.artifacts[] | select(.expired == false) | .id')
           if [[ -z "$artifact" ]]; then
-            echo "Test inventory comparison: run $run has no available inventory." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Test inventory comparison: run $run has no inventory for Python $PYTHON_VERSION." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           baseline=$(mktemp -d "$RUNNER_TEMP/inventory-baseline.XXXXXX")
-          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name pytest-nodeids --dir "$baseline"
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "pytest-nodeids-$PYTHON_VERSION" --dir "$baseline"
           python -B compare_inventories.py "$baseline/pytest-nodeids.txt" \
-            "$RUNNER_TEMP/pytest-nodeids.txt" --label "vs run $run" > "$baseline/comparison.txt"
+            "$RUNNER_TEMP/pytest-nodeids.txt" --label "vs run $run / Python $PYTHON_VERSION" > "$baseline/comparison.txt"
           cat "$baseline/comparison.txt"
           cat "$baseline/comparison.txt" >> "$GITHUB_STEP_SUMMARY"
