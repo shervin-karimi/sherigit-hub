@@ -16,7 +16,7 @@ import ssl
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-import time
+from time import sleep as retry_sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -293,7 +293,7 @@ def collect(*, timeout=REQUEST_TIMEOUT, backoff=RETRY_BACKOFF, gate=None,
                 log_event("capture_retry", attempt=attempt, max_attempts=max_attempts,
                           retry_in_seconds=delay, reason=reason, error_type=type(error).__name__,
                           at_utc=previous.isoformat())
-                time.sleep(delay)
+                retry_sleep(delay)
                 continue
             checked_clock(received, started)
             if gate is not None:

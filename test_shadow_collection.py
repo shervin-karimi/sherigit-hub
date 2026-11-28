@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import ssl
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import MagicMock, call, patch
 from urllib.error import HTTPError, URLError
@@ -20,6 +21,7 @@ import shadow_watch as watch
 
 START = datetime(2026, 11, 21, 6, tzinfo=timezone.utc)  # 09:30 Tehran
 APPEND, READ_STREAM, FETCH = collector.append, collector.read_stream, collector.fetch
+REAL_SLEEP = time.sleep
 
 
 def body(price=100):
@@ -51,7 +53,8 @@ class ShadowCollectionTests(unittest.TestCase):
         self.mock("shadow_schedule.ZoneInfo", return_value=collector.TEHRAN)
         self.fetch = self.mock("shadow_collector.fetch")
         self.clock = self.mock("shadow_collector.utc_now", return_value=START)
-        self.sleep = self.mock("shadow_collector.time.sleep")
+        # Patch only the collector alias, never the shared time module.
+        self.sleep = self.mock("shadow_collector.retry_sleep")
         self.mock("shadow_collector.append", side_effect=lambda *a, **kw:
                   APPEND(*a, **kw, dataset_class=collector.SYNTHETIC))
         self.mock("shadow_collector.read_stream", side_effect=lambda root:
@@ -78,6 +81,13 @@ class ShadowCollectionTests(unittest.TestCase):
 
     def schedule(self, path, window="09:30-09:35", *extra):
         return schedule.main(["--calendar", str(path), "--window", window, *extra])
+
+    def test_retry_sleep_mock_is_local(self):
+        self.assertIs(time.sleep, REAL_SLEEP)
+        self.assertIs(collector.retry_sleep, self.sleep)
+        # An unrelated sleep must not count as a collector retry.
+        time.sleep(0)
+        self.sleep.assert_not_called()
 
     def test_dns_and_tls_retries_then_write_only_the_successful_attempt(self):
         times = [START + timedelta(seconds=i) for i in range(6)]
